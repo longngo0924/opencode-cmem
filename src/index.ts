@@ -45,11 +45,14 @@ async function workerFetch(
 }
 
 /**
- * Strip <private>...</private> tags before sending to worker.
- * Matches claude-mem's privacy tag system.
+ * Strip privacy and recursion-prevention tags before sending to worker.
+ * - <private>...</private> — user-level privacy control
+ * - <claude-mem-context>...</claude-mem-context> — system-level recursion prevention
  */
 function stripPrivateTags(text: string): string {
-  return text.replace(/<private>[\s\S]*?<\/private>/g, "")
+  return text
+    .replace(/<private>[\s\S]*?<\/private>/g, "")
+    .replace(/<claude-mem-context>[\s\S]*?<\/claude-mem-context>/g, "")
 }
 
 // -- Plugin -------------------------------------------------------------------
@@ -60,12 +63,21 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     ctx.directory?.split("/").pop() ||
     "default"
 
+  // Tools that produce low-value observations (matches claude-mem's save-hook skip list)
+  const SKIP_TOOLS = new Set([
+    "TodoWrite", "AskUserQuestion", "ListMcpResourcesTool",
+    "SlashCommand", "Skill",
+  ])
+
   // Session tracking
   let claudeSessionId: string | null = null
   let lastUserMessage = ""
   let lastAssistantMessage = ""
   let contextInjected = false
   let sessionInitialized = false
+  let promptPrivate = false
+  let summarySent = false
+  const recentToolFiles = new Set<string>()
 
   // -- Health check on startup (non-blocking) ---------------------------------
   const healthRes = await workerFetch("/api/health", { timeout: 2000 })
@@ -145,7 +157,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
   // -- Stage 4: Stop — generate summary ---------------------------------------
   async function sendSummary(): Promise<void> {
-    if (!claudeSessionId) return
+    if (!claudeSessionId || summarySent) return
+    summarySent = true
 
     await workerFetch("/api/sessions/summarize", {
       method: "POST",
@@ -155,6 +168,13 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         last_user_message: lastUserMessage.slice(0, 5000),
         last_assistant_message: lastAssistantMessage.slice(0, 5000),
       }),
+    })
+
+    // Signal processing complete (updates web viewer UI)
+    await workerFetch("/api/processing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ isProcessing: false }),
     })
   }
 
@@ -174,6 +194,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     lastAssistantMessage = ""
     contextInjected = false
     sessionInitialized = false
+    summarySent = false
+    recentToolFiles.clear()
   }
 
   // -- Return plugin definition -----------------------------------------------
@@ -184,7 +206,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       claude_mem_search: tool({
         description:
           "Search claude-mem memory for past coding session observations. " +
-          "Returns observations matching the query from previous sessions.",
+          "Returns compact index with IDs (~50-100 tokens/result). " +
+          "Use get_observations to fetch full details by IDs.",
         args: {
           query: tool.schema.string().describe("Search query keywords"),
           type: tool.schema
@@ -195,6 +218,34 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             .number()
             .optional()
             .describe("Max results (default: 20)"),
+          obs_type: tool.schema
+            .enum(["discovery", "decision", "bugfix", "feature", "refactor", "change"])
+            .optional()
+            .describe("Filter by observation type"),
+          concepts: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by concepts (comma-separated)"),
+          files: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by file paths (comma-separated)"),
+          dateStart: tool.schema
+            .string()
+            .optional()
+            .describe("ISO timestamp filter start"),
+          dateEnd: tool.schema
+            .string()
+            .optional()
+            .describe("ISO timestamp filter end"),
+          orderBy: tool.schema
+            .enum(["date_desc", "date_asc", "relevance"])
+            .optional()
+            .describe("Sort order (default: relevance)"),
+          offset: tool.schema
+            .number()
+            .optional()
+            .describe("Pagination offset"),
         },
         async execute(args) {
           const params = new URLSearchParams({
@@ -203,6 +254,13 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           })
           if (args.type) params.set("type", args.type)
           if (args.limit) params.set("limit", String(args.limit))
+          if (args.obs_type) params.set("obs_type", args.obs_type)
+          if (args.concepts) params.set("concepts", args.concepts)
+          if (args.files) params.set("files", args.files)
+          if (args.dateStart) params.set("dateStart", args.dateStart)
+          if (args.dateEnd) params.set("dateEnd", args.dateEnd)
+          if (args.orderBy) params.set("orderBy", args.orderBy)
+          if (args.offset) params.set("offset", String(args.offset))
           if (project) params.set("project", project)
 
           const res = await workerFetch(`/api/search?${params}`)
@@ -212,17 +270,65 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         },
       }),
 
+      claude_mem_get_observations: tool({
+        description:
+          "Fetch full observation details by IDs (~500-1000 tokens/result). " +
+          "Use after search/timeline to get complete details. " +
+          "Always batch multiple IDs in one call.",
+        args: {
+          ids: tool.schema
+            .array(tool.schema.number())
+            .describe("Array of observation IDs to fetch"),
+        },
+        async execute(args) {
+          const results = await Promise.all(
+            args.ids.map((id) => workerFetch(`/api/observation/${id}`)),
+          )
+          const observations: unknown[] = []
+          for (const res of results) {
+            if (res?.ok) observations.push(await res.json())
+            else if (res) observations.push({ error: true, status: res.status })
+          }
+          return JSON.stringify(observations, null, 2)
+        },
+      }),
+
       claude_mem_timeline: tool({
         description:
           "Get a timeline of recent observations from claude-mem. " +
-          "Shows what happened in recent coding sessions.",
+          "Shows what happened in recent coding sessions. " +
+          "Can center on a specific observation with anchor.",
         args: {
           limit: tool.schema
             .number()
             .optional()
             .describe("Number of recent sessions (default: 3)"),
+          anchor: tool.schema
+            .number()
+            .optional()
+            .describe("Observation ID to center timeline around"),
+          depth_before: tool.schema
+            .number()
+            .optional()
+            .describe("Records before anchor (default: 3)"),
+          depth_after: tool.schema
+            .number()
+            .optional()
+            .describe("Records after anchor (default: 3)"),
         },
         async execute(args) {
+          // Anchor-based timeline uses a different endpoint
+          if (args.anchor != null) {
+            const params = new URLSearchParams({ project })
+            params.set("anchor", String(args.anchor))
+            if (args.depth_before != null) params.set("depth_before", String(args.depth_before))
+            if (args.depth_after != null) params.set("depth_after", String(args.depth_after))
+            const res = await workerFetch(`/api/timeline?${params}`)
+            if (!res) return "claude-mem worker unreachable"
+            if (!res.ok) return `Timeline failed: ${res.status}`
+            return await res.text()
+          }
+
           const params = new URLSearchParams({
             project,
             limit: String(args.limit || 3),
@@ -302,6 +408,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           claudeSessionId = `opencode-${project}-${Date.now()}`
           contextInjected = false
           sessionInitialized = false
+          summarySent = false
+          recentToolFiles.clear()
           break
 
         case "session.idle":
@@ -311,6 +419,36 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         case "session.deleted":
           await completeSession()
           break
+
+        // P0: Track assistant messages for better summaries
+        case "message.updated": {
+          const msg = (event as any).properties?.info
+          if (msg?.role === "assistant") {
+            const text = msg.parts
+              ?.filter((p: any) => p.type === "text")
+              .map((p: any) => p.text)
+              .join("\n") || ""
+            if (text) lastAssistantMessage = text.slice(0, 5000)
+          }
+          break
+        }
+
+        // P1: Track file edits as observations (skip if already captured by tool.execute.after)
+        case "file.edited": {
+          const file = (event as any).properties?.file
+          if (file && recentToolFiles.has(file)) {
+            recentToolFiles.delete(file)
+            break
+          }
+          recordObservation("file.edited", (event as any).properties, null).catch(() => {})
+          break
+        }
+
+        // P2: Track session errors as observations
+        case "session.error": {
+          recordObservation("session.error", (event as any).properties, null).catch(() => {})
+          break
+        }
       }
     },
 
@@ -319,15 +457,29 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       const textParts = output.parts
         .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text")
         .map((p) => p.text)
+      const joined = textParts.join("\n")
+
+      // Skip fully private prompts (entire message wrapped in <private> tags)
+      if (stripPrivateTags(joined).trim().length === 0) {
+        promptPrivate = true
+        return
+      }
+
+      promptPrivate = false
       if (textParts.length > 0) {
-        lastUserMessage = textParts.join("\n")
+        lastUserMessage = joined
         initSession(lastUserMessage).catch(() => {})
       }
     },
 
     // == Stage 3: Capture tool usage (PostToolUse) =============================
     "tool.execute.after": async (input, output) => {
-      if (input.tool.startsWith("claude_mem_")) return
+      if (input.tool.startsWith("claude_mem_") || SKIP_TOOLS.has(input.tool)) return
+      if (promptPrivate) return
+
+      // Track file paths from tool args to dedup against file.edited events
+      const filePath = input.args?.file_path || input.args?.path || input.args?.file
+      if (typeof filePath === "string") recentToolFiles.add(filePath)
 
       if (output.output) {
         lastAssistantMessage = output.output.slice(0, 5000)

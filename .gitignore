@@ -5,3 +5,4 @@ dist/
 bun.lock
 .serena/
 temp/
+.claude/settings.local.json

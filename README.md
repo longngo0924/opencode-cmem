@@ -53,8 +53,9 @@ Maps claude-mem's 5-stage hook lifecycle to OpenCode events:
 
 | Tool | Description |
 |---|---|
-| `claude_mem_search` | Search past observations |
-| `claude_mem_timeline` | Recent session timeline |
+| `claude_mem_search` | Search past observations (with filters for type, date, concepts, files) |
+| `claude_mem_get_observations` | Fetch full observation details by IDs |
+| `claude_mem_timeline` | Recent session timeline (supports anchor-based view) |
 | `claude_mem_save` | Manually save a memory |
 | `claude_mem_status` | Worker health + stats |
 
@@ -84,6 +85,10 @@ bun run build
 ## API reference
 
 Based on [claude-mem Platform Integration Guide](https://docs.claude-mem.ai/platform-integration).
+
+## Disclaimer
+
+This project is not built by the OpenCode team and is not affiliated with Anomaly or the OpenCode project in any way.
 
 ## License
 
