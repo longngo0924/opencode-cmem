@@ -1,0 +1,46 @@
+{
+  "name": "opencode-cmem",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for claude-mem — share persistent memory between Claude Code and OpenCode",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "bun test",
+    "prepublishOnly": "npm run build",
+    "local:install": "cp src/index.ts ~/.config/opencode/plugins/claude-mem.ts && echo 'Installed to ~/.config/opencode/plugins/claude-mem.ts'"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "claude-mem",
+    "claude-code",
+    "memory",
+    "persistent-memory",
+    "ai",
+    "coding-agent"
+  ],
+  "author": "Long Ngo",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/longngo/opencode-cmem.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
