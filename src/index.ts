@@ -25,10 +25,80 @@ const HEALTH_CHECK_INTERVAL_MS = 30_000
 const BATCH_FLUSH_INTERVAL_MS = 5_000
 const BATCH_MAX_SIZE = 10
 const DEDUP_WINDOW_MS = 60_000
+const CONTEXT_CACHE_TTL_MS = 60_000
+
+// -- P1.2: Structured logging ---------------------------------------------------
+
+type LogLevel = "error" | "warn" | "info" | "debug"
+const LOG_LEVELS: Record<LogLevel, number> = { error: 1, warn: 2, info: 3, debug: 4 }
+
+function resolveLogLevel(): number {
+  const envLevel = process.env.CLAUDE_MEM_LOG_LEVEL?.toLowerCase()
+  if (envLevel && envLevel in LOG_LEVELS) return LOG_LEVELS[envLevel as LogLevel]
+  return LOG_LEVELS.info // default
+}
+
+const currentLogLevel = resolveLogLevel()
+
+const log = {
+  debug: (...args: unknown[]) => currentLogLevel >= 4 && console.debug("[claude-mem]", ...args),
+  info: (...args: unknown[]) => currentLogLevel >= 3 && console.info("[claude-mem]", ...args),
+  warn: (...args: unknown[]) => currentLogLevel >= 2 && console.warn("[claude-mem]", ...args),
+  error: (...args: unknown[]) => currentLogLevel >= 1 && console.error("[claude-mem]", ...args),
+}
+
+// -- P1.4: Configuration validation ---------------------------------------------
+
+interface WorkerConfig {
+  url: string
+  port: number
+  errors: string[]
+}
+
+let _validatedConfig: WorkerConfig | null = null
+
+function validateConfig(): WorkerConfig {
+  if (_validatedConfig) return _validatedConfig
+
+  const errors: string[] = []
+  let port = DEFAULT_PORT
+  let baseUrl = ""
+
+  // Validate CLAUDE_MEM_WORKER_PORT
+  if (process.env.CLAUDE_MEM_WORKER_PORT) {
+    const raw = process.env.CLAUDE_MEM_WORKER_PORT
+    const parsed = Number(raw)
+    if (!Number.isInteger(parsed) || isNaN(parsed)) {
+      errors.push(`CLAUDE_MEM_WORKER_PORT="${raw}" is not a valid integer`)
+    } else if (parsed < 1024 || parsed > 65535) {
+      errors.push(`CLAUDE_MEM_WORKER_PORT=${parsed} is out of range (1024-65535)`)
+    } else {
+      port = parsed
+    }
+  }
+
+  // Validate CLAUDE_MEM_WORKER_URL
+  if (process.env.CLAUDE_MEM_WORKER_URL) {
+    try {
+      const url = new URL(process.env.CLAUDE_MEM_WORKER_URL)
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        errors.push(`CLAUDE_MEM_WORKER_URL must use http:// or https://, got "${url.protocol}"`)
+      } else {
+        baseUrl = process.env.CLAUDE_MEM_WORKER_URL.replace(/\/+$/, "")
+      }
+    } catch {
+      errors.push(`CLAUDE_MEM_WORKER_URL="${process.env.CLAUDE_MEM_WORKER_URL}" is not a valid URL`)
+    }
+  }
+
+  const url = baseUrl || `http://127.0.0.1:${port}`
+
+  _validatedConfig = { url, port, errors }
+  return _validatedConfig
+}
 
 function getWorkerUrl(): string {
-  const port = process.env.CLAUDE_MEM_WORKER_PORT || DEFAULT_PORT
-  return `http://127.0.0.1:${port}`
+  return validateConfig().url
 }
 
 // -- Health monitoring (module-level, shared across plugin instances) ---------
@@ -56,10 +126,14 @@ async function workerFetch(
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(`${getWorkerUrl()}${path}`, {
+      const url = `${getWorkerUrl()}${path}`
+      const startTime = Date.now()
+      const res = await fetch(url, {
         ...fetchInit,
         signal: AbortSignal.timeout(timeout),
       })
+      const elapsed = Date.now() - startTime
+      log.debug(`${fetchInit.method || "GET"} ${path} → ${res.status} (${elapsed}ms)`)
       if (res.ok) return res
       // 4xx errors are client-side and not retryable
       if (res.status >= 400 && res.status < 500) return res
@@ -67,6 +141,7 @@ async function workerFetch(
     } catch (err) {
       lastError = err
       workerHealthy = false
+      log.debug(`Request to ${path} failed (attempt ${attempt + 1}/${retries + 1}): ${err instanceof Error ? err.message : err}`)
     }
 
     if (attempt < retries) {
@@ -77,9 +152,7 @@ async function workerFetch(
 
   if (critical) {
     failedCriticalRequests.push({ path, init: fetchInit })
-    console.warn(
-      `[claude-mem] Critical request to ${path} failed after ${retries + 1} attempts, queued for retry`,
-    )
+    log.warn(`Critical request to ${path} failed after ${retries + 1} attempts, queued for retry`)
   }
 
   return null
@@ -124,7 +197,7 @@ function startHealthMonitor(): void {
       workerHealthy = res.ok
 
       if (wasUnhealthy && workerHealthy) {
-        console.info("[claude-mem] Worker recovered, retrying queued critical requests")
+        log.info("Worker recovered, retrying queued critical requests")
         await retryFailedCriticalRequests()
       }
     } catch {
@@ -144,7 +217,7 @@ async function retryFailedCriticalRequests(): Promise<void> {
   for (const { path, init } of requests) {
     const res = await workerFetch(path, { ...init, retries: 1, critical: true })
     if (res?.ok) {
-      console.info(`[claude-mem] Successfully retried critical request to ${path}`)
+      log.info(`Successfully retried critical request to ${path}`)
     }
   }
 }
@@ -190,14 +263,24 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
   // -- Start health monitoring -------------------------------------------------
   startHealthMonitor()
 
+  // -- P1.4: Validate configuration on startup --------------------------------
+  const config = validateConfig()
+  if (config.errors.length > 0) {
+    for (const err of config.errors) log.error(err)
+    log.warn(`Using default worker URL: ${config.url}`)
+  } else {
+    log.info(`Worker URL: ${config.url}`)
+  }
+
   // -- Health check on startup (non-blocking) ---------------------------------
-  const healthRes = await workerFetch("/api/health", { timeout: 2000 })
+  const healthRes = await workerFetch("/api/health", { timeout: 2000, retries: 0 })
   workerHealthy = !!(healthRes && healthRes.ok)
   if (!workerHealthy) {
-    console.warn(
-      `[claude-mem] Worker not reachable at ${getWorkerUrl()}. ` +
-        `Start it with: claude-mem worker start`,
+    log.warn(
+      `Worker not reachable at ${getWorkerUrl()}. Start it with: claude-mem worker start`,
     )
+  } else {
+    log.info("Worker health check passed")
   }
 
   // -- P0.3: Observation buffer flush ------------------------------------------
@@ -242,15 +325,32 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     }
   }
 
+  // -- P1.3: Context injection cache (60s TTL) ----------------------------------
+  let contextCache: { text: string; timestamp: number } | null = null
+
+  function invalidateContextCache(): void {
+    contextCache = null
+  }
+
   // -- Stage 1: SessionStart — inject prior context ---------------------------
   async function injectContext(): Promise<string> {
+    // Return cached context if still valid
+    if (contextCache && Date.now() - contextCache.timestamp < CONTEXT_CACHE_TTL_MS) {
+      log.debug("Context injection cache hit")
+      return contextCache.text
+    }
+
     const res = await workerFetch(
       `/api/context/inject?projects=${encodeURIComponent(project)}`,
       { timeout: 3000 },
     )
     if (res && res.ok) {
       const text = await res.text()
-      if (text && text.trim().length > 0) return text
+      if (text && text.trim().length > 0) {
+        contextCache = { text, timestamp: Date.now() }
+        log.debug("Context injection cache miss — fetched and cached")
+        return text
+      }
     }
     return ""
   }
@@ -579,6 +679,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           lines.push(`Health monitoring: active (${HEALTH_CHECK_INTERVAL_MS / 1000}s interval)`)
           lines.push(`Observation buffer: ${observationBuffer.length} pending`)
           lines.push(`Queued critical requests: ${failedCriticalRequests.length}`)
+          lines.push(`Log level: ${process.env.CLAUDE_MEM_LOG_LEVEL || "info"}`)
 
           if (version?.ok) {
             const v = (await version.json()) as { version?: string }
@@ -616,6 +717,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           recentToolFiles.clear()
           recentHashes.clear()
           observationBuffer.length = 0
+          invalidateContextCache()
           break
 
         case "session.idle":
