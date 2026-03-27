@@ -586,6 +586,14 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
         case "session.deleted":
           await sendSummary()
+          if (claudeSessionId) {
+            await workerFetch("/api/sessions/complete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ contentSessionId: claudeSessionId }),
+              critical: true,
+            })
+          }
           resetSession()
           break
 
