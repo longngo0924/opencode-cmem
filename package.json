@@ -1,6 +1,6 @@
 {
   "name": "opencode-cmem",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OpenCode plugin for claude-mem — share persistent memory between Claude Code and OpenCode",
   "type": "module",
   "main": "dist/index.js",
