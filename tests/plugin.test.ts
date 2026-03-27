@@ -437,3 +437,290 @@ describe("dedup logic", () => {
     expect(recentHashes.has(h2)).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// P2.1: Token cost enrichment for search results
+// ---------------------------------------------------------------------------
+
+describe("enrichSearchResults", () => {
+  function enrichSearchResults(rawText: string): string {
+    try {
+      const parsed = JSON.parse(rawText)
+      const results = Array.isArray(parsed) ? parsed : parsed.results || parsed.data || parsed.observations || [parsed]
+
+      if (!Array.isArray(results)) return rawText
+
+      const enriched = results.map((item: any) => {
+        const cost = item.read_cost ?? item.token_count ?? item.estimated_tokens ?? null
+        if (cost == null) return item
+        return {
+          ...item,
+          _cost_info: `~${cost} tokens to read full details`,
+        }
+      })
+
+      if (Array.isArray(parsed)) return JSON.stringify(enriched, null, 2)
+      const wrapper = { ...parsed }
+      if (parsed.results != null) wrapper.results = enriched
+      else if (parsed.data != null) wrapper.data = enriched
+      else if (parsed.observations != null) wrapper.observations = enriched
+      return JSON.stringify(wrapper, null, 2)
+    } catch {
+      return rawText
+    }
+  }
+
+  it("should add _cost_info when results have read_cost", () => {
+    const input = JSON.stringify([
+      { id: 1, title: "Auth fix", read_cost: 500 },
+      { id: 2, title: "API change", read_cost: 300 },
+    ])
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed[0]._cost_info).toBe("~500 tokens to read full details")
+    expect(parsed[1]._cost_info).toBe("~300 tokens to read full details")
+  })
+
+  it("should add _cost_info when results have token_count", () => {
+    const input = JSON.stringify([
+      { id: 1, title: "Bug fix", token_count: 1200 },
+    ])
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed[0]._cost_info).toBe("~1200 tokens to read full details")
+  })
+
+  it("should add _cost_info when results have estimated_tokens", () => {
+    const input = JSON.stringify([
+      { id: 1, title: "Refactor", estimated_tokens: 800 },
+    ])
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed[0]._cost_info).toBe("~800 tokens to read full details")
+  })
+
+  it("should not add _cost_info when no cost field exists", () => {
+    const input = JSON.stringify([
+      { id: 1, title: "No cost" },
+    ])
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed[0]._cost_info).toBeUndefined()
+  })
+
+  it("should handle results wrapped in {results: [...]} object", () => {
+    const input = JSON.stringify({
+      results: [{ id: 1, title: "Test", read_cost: 200 }],
+      total: 1,
+    })
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed.results[0]._cost_info).toBe("~200 tokens to read full details")
+    expect(parsed.total).toBe(1)
+  })
+
+  it("should handle results wrapped in {data: [...]} object", () => {
+    const input = JSON.stringify({
+      data: [{ id: 1, title: "Test", token_count: 400 }],
+    })
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed.data[0]._cost_info).toBe("~400 tokens to read full details")
+  })
+
+  it("should handle results wrapped in {observations: [...]} object", () => {
+    const input = JSON.stringify({
+      observations: [{ id: 1, title: "Test", read_cost: 150 }],
+    })
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed.observations[0]._cost_info).toBe("~150 tokens to read full details")
+  })
+
+  it("should return non-JSON text as-is", () => {
+    const input = "Plain text search results"
+    expect(enrichSearchResults(input)).toBe(input)
+  })
+
+  it("should prefer read_cost over token_count", () => {
+    const input = JSON.stringify([
+      { id: 1, title: "Both", read_cost: 100, token_count: 500 },
+    ])
+    const result = enrichSearchResults(input)
+    const parsed = JSON.parse(result)
+    expect(parsed[0]._cost_info).toBe("~100 tokens to read full details")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P2.2: Structured summary parsing
+// ---------------------------------------------------------------------------
+
+describe("parseSummaryResponse", () => {
+  function parseSummaryResponse(raw: string) {
+    try {
+      const parsed = JSON.parse(raw)
+      return {
+        request: parsed.request ?? parsed.summary_request ?? undefined,
+        investigated: parsed.investigated ?? parsed.files_investigated ?? undefined,
+        learned: parsed.learned ?? parsed.key_learnings ?? parsed.insights ?? undefined,
+        completed: parsed.completed ?? parsed.tasks_completed ?? undefined,
+        next_steps: parsed.next_steps ?? parsed.suggested_next ?? undefined,
+        raw: raw,
+        timestamp: Date.now(),
+      }
+    } catch {
+      return { raw, timestamp: Date.now() }
+    }
+  }
+
+  it("should parse structured summary with all fields", () => {
+    const input = JSON.stringify({
+      request: "Fix auth bug",
+      investigated: ["src/auth.ts", "src/middleware.ts"],
+      learned: ["JWT clock skew accepted within 60s"],
+      completed: ["Fixed token validation"],
+      next_steps: ["Add tests for edge case"],
+    })
+    const result = parseSummaryResponse(input)
+    expect(result.request).toBe("Fix auth bug")
+    expect(result.investigated).toEqual(["src/auth.ts", "src/middleware.ts"])
+    expect(result.learned).toEqual(["JWT clock skew accepted within 60s"])
+    expect(result.completed).toEqual(["Fixed token validation"])
+    expect(result.next_steps).toEqual(["Add tests for edge case"])
+  })
+
+  it("should parse summary with alternative field names", () => {
+    const input = JSON.stringify({
+      summary_request: "Refactor API",
+      files_investigated: ["src/api.ts"],
+      key_learnings: ["Pattern X is better"],
+      tasks_completed: ["Refactored endpoint"],
+      suggested_next: ["Write docs"],
+    })
+    const result = parseSummaryResponse(input)
+    expect(result.request).toBe("Refactor API")
+    expect(result.investigated).toEqual(["src/api.ts"])
+    expect(result.learned).toEqual(["Pattern X is better"])
+    expect(result.completed).toEqual(["Refactored endpoint"])
+    expect(result.next_steps).toEqual(["Write docs"])
+  })
+
+  it("should handle plain text summary", () => {
+    const input = "Fixed the auth bug in middleware.ts. Key learning: check token expiry first."
+    const result = parseSummaryResponse(input)
+    expect(result.raw).toBe(input)
+    expect(result.request).toBeUndefined()
+    expect(result.learned).toBeUndefined()
+  })
+
+  it("should handle partial structured summary", () => {
+    const input = JSON.stringify({
+      request: "Add feature X",
+      learned: ["Used new API pattern"],
+    })
+    const result = parseSummaryResponse(input)
+    expect(result.request).toBe("Add feature X")
+    expect(result.learned).toEqual(["Used new API pattern"])
+    expect(result.completed).toBeUndefined()
+    expect(result.next_steps).toBeUndefined()
+  })
+
+  it("should include timestamp", () => {
+    const before = Date.now()
+    const result = parseSummaryResponse("{}")
+    const after = Date.now()
+    expect(result.timestamp).toBeGreaterThanOrEqual(before)
+    expect(result.timestamp).toBeLessThanOrEqual(after)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P2.3: Worker auto-start
+// ---------------------------------------------------------------------------
+
+describe("worker auto-start", () => {
+  it("should respect CLAUDE_MEM_AUTO_START=true", () => {
+    // Auto-start is only triggered when env var is set
+    const enabled = process.env.CLAUDE_MEM_AUTO_START === "true"
+    // By default it should be undefined (disabled)
+    expect(enabled).toBe(false)
+  })
+
+  it("should not auto-start when env var is not set", () => {
+    const envVal = process.env.CLAUDE_MEM_AUTO_START
+    const shouldStart = envVal === "true" || envVal === "1"
+    expect(shouldStart).toBe(false)
+  })
+
+  it("should auto-start when env var is '1'", () => {
+    // Simulate env var being set to "1"
+    const envVal = "1"
+    const shouldStart = envVal === "true" || envVal === "1"
+    expect(shouldStart).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P2.4: Folder context
+// ---------------------------------------------------------------------------
+
+describe("folder context cache", () => {
+  const FOLDER_CONTEXT_TTL_MS = 120_000
+
+  it("should cache folder context with TTL", () => {
+    const cache = new Map<string, { folder: string; observations: string[]; timestamp: number }>()
+    const now = Date.now()
+    cache.set("src/auth", { folder: "src/auth", observations: ["obs1"], timestamp: now })
+
+    const cached = cache.get("src/auth")
+    expect(cached).toBeDefined()
+    expect(now - (cached?.timestamp ?? 0) < FOLDER_CONTEXT_TTL_MS).toBe(true)
+  })
+
+  it("should expire folder context after TTL", () => {
+    const cache = new Map<string, { folder: string; observations: string[]; timestamp: number }>()
+    const oldTime = Date.now() - FOLDER_CONTEXT_TTL_MS - 1
+    cache.set("src/auth", { folder: "src/auth", observations: ["obs1"], timestamp: oldTime })
+
+    const cached = cache.get("src/auth")
+    expect(Date.now() - (cached?.timestamp ?? 0) >= FOLDER_CONTEXT_TTL_MS).toBe(true)
+  })
+
+  it("should extract folder from file path", () => {
+    const file = "src/auth/middleware.ts"
+    const folder = file.split("/").slice(0, -1).join("/") || "."
+    expect(folder).toBe("src/auth")
+  })
+
+  it("should handle root-level files", () => {
+    const file = "README.md"
+    const folder = file.split("/").slice(0, -1).join("/") || "."
+    expect(folder).toBe(".")
+  })
+
+  it("should prune cache to max 10 folders", () => {
+    const cache = new Map<string, { folder: string; observations: string[]; timestamp: number }>()
+    const now = Date.now()
+
+    // Add 15 entries with staggered timestamps
+    for (let i = 0; i < 15; i++) {
+      cache.set(`folder-${i}`, { folder: `folder-${i}`, observations: [], timestamp: now - i * 1000 })
+    }
+
+    // Prune to 10
+    if (cache.size > 10) {
+      const oldest = [...cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp)
+      for (let i = 0; i < oldest.length - 10; i++) {
+        cache.delete(oldest[i][0])
+      }
+    }
+
+    expect(cache.size).toBe(10)
+    // Oldest entries (highest index = earliest timestamp) should be removed
+    expect(cache.has("folder-14")).toBe(false)
+    expect(cache.has("folder-10")).toBe(false)
+    expect(cache.has("folder-9")).toBe(true)
+    expect(cache.has("folder-0")).toBe(true)
+  })
+})

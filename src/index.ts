@@ -26,6 +26,7 @@ const BATCH_FLUSH_INTERVAL_MS = 5_000
 const BATCH_MAX_SIZE = 10
 const DEDUP_WINDOW_MS = 60_000
 const CONTEXT_CACHE_TTL_MS = 60_000
+const FOLDER_CONTEXT_TTL_MS = 120_000
 
 // -- P1.2: Structured logging ---------------------------------------------------
 
@@ -222,6 +223,195 @@ async function retryFailedCriticalRequests(): Promise<void> {
   }
 }
 
+// -- P2.1: Token cost enrichment for search results ----------------------------
+
+/**
+ * Parse worker search response and surface token cost information.
+ * The worker returns results that may include `read_cost` or `token_count`
+ * fields. We enrich the response so the LLM can make informed decisions
+ * about how many full observations to fetch.
+ */
+function enrichSearchResults(rawText: string): string {
+  try {
+    const parsed = JSON.parse(rawText)
+    // Handle both array and object wrappers
+    const results = Array.isArray(parsed) ? parsed : parsed.results || parsed.data || parsed.observations || [parsed]
+
+    if (!Array.isArray(results)) return rawText
+
+    const enriched = results.map((item: any) => {
+      const cost = item.read_cost ?? item.token_count ?? item.estimated_tokens ?? null
+      if (cost == null) return item
+      return {
+        ...item,
+        _cost_info: `~${cost} tokens to read full details`,
+      }
+    })
+
+    // Preserve the original wrapper structure
+    if (Array.isArray(parsed)) return JSON.stringify(enriched, null, 2)
+    const wrapper = { ...parsed }
+    if (parsed.results != null) wrapper.results = enriched
+    else if (parsed.data != null) wrapper.data = enriched
+    else if (parsed.observations != null) wrapper.observations = enriched
+    return JSON.stringify(wrapper, null, 2)
+  } catch {
+    // Not JSON — return as-is (worker may return plain text)
+    return rawText
+  }
+}
+
+// -- P2.3: Worker auto-start ---------------------------------------------------
+
+let workerAutoStarted = false
+
+/**
+ * Attempt to auto-start the claude-mem worker if health check fails.
+ * Controlled by CLAUDE_MEM_AUTO_START env var (default: disabled).
+ * Tries common binary paths and `npx` fallback.
+ */
+async function tryAutoStartWorker(): Promise<boolean> {
+  if (workerAutoStarted) return false
+  if (process.env.CLAUDE_MEM_AUTO_START !== "true" && process.env.CLAUDE_MEM_AUTO_START !== "1") {
+    return false
+  }
+
+  workerAutoStarted = true
+  const commands = [
+    "claude-mem worker start",
+    "npx claude-mem worker start",
+  ]
+
+  for (const cmd of commands) {
+    try {
+      const binary = cmd.split(" ")[0]
+      const proc = Bun.spawn(cmd.split(" "), {
+        stdout: "inherit",
+        stderr: "inherit",
+        detached: true,
+      })
+      proc.unref()
+      log.info(`Auto-starting worker: ${cmd} (PID ${proc.pid})`)
+
+      // Wait briefly for worker to become ready
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 1000))
+        try {
+          const res = await fetch(`${getWorkerUrl()}/api/health`, {
+            signal: AbortSignal.timeout(2000),
+          })
+          if (res.ok) {
+            log.info("Worker auto-start succeeded")
+            workerHealthy = true
+            return true
+          }
+        } catch {
+          // Not ready yet
+        }
+      }
+
+      log.warn(`Worker auto-start via "${cmd}" did not become ready in time`)
+    } catch (err) {
+      log.debug(`Auto-start command "${cmd}" not available: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  log.warn("Worker auto-start failed. Start manually: claude-mem worker start")
+  return false
+}
+
+// -- P2.2: Structured summary storage ------------------------------------------
+
+/**
+ * Stored structured session summary from the worker.
+ * Used to enhance context injection with learned patterns.
+ */
+interface StructuredSummary {
+  request?: string
+  investigated?: string[]
+  learned?: string[]
+  completed?: string[]
+  next_steps?: string[]
+  raw?: string
+  timestamp: number
+}
+
+let lastSummary: StructuredSummary | null = null
+
+/**
+ * Parse the worker's summarize response into a structured summary.
+ * The worker may return JSON with sections like Request, Investigated,
+ * Learned, Completed, Next Steps — or a plain text summary.
+ */
+function parseSummaryResponse(raw: string): StructuredSummary {
+  try {
+    const parsed = JSON.parse(raw)
+    return {
+      request: parsed.request ?? parsed.summary_request ?? undefined,
+      investigated: parsed.investigated ?? parsed.files_investigated ?? undefined,
+      learned: parsed.learned ?? parsed.key_learnings ?? parsed.insights ?? undefined,
+      completed: parsed.completed ?? parsed.tasks_completed ?? undefined,
+      next_steps: parsed.next_steps ?? parsed.suggested_next ?? undefined,
+      raw: raw,
+      timestamp: Date.now(),
+    }
+  } catch {
+    return { raw, timestamp: Date.now() }
+  }
+}
+
+// -- P2.4: Folder context tracking ---------------------------------------------
+
+interface FolderContext {
+  folder: string
+  observations: string[]
+  timestamp: number
+}
+
+const folderContextCache = new Map<string, FolderContext>()
+
+/**
+ * Fetch recent observations for a folder and cache them.
+ */
+async function fetchFolderContext(folder: string, projectName?: string): Promise<string> {
+  const now = Date.now()
+  const cached = folderContextCache.get(folder)
+  if (cached && now - cached.timestamp < FOLDER_CONTEXT_TTL_MS) {
+    log.debug(`Folder context cache hit for ${folder}`)
+    return cached.observations.join("\n")
+  }
+
+  try {
+    const params = new URLSearchParams({
+      query: folder,
+      type: "observations",
+      limit: "5",
+      orderBy: "date_desc",
+    })
+    if (projectName) params.set("project", projectName)
+
+    const res = await workerFetch(`/api/search?${params}`)
+    if (res?.ok) {
+      const text = await res.text()
+      if (text.trim()) {
+        folderContextCache.set(folder, { folder, observations: [text], timestamp: now })
+        // Prune old entries (keep max 10 folders)
+        if (folderContextCache.size > 10) {
+          const oldest = [...folderContextCache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp)
+          for (let i = 0; i < oldest.length - 10; i++) {
+            folderContextCache.delete(oldest[i][0])
+          }
+        }
+        return text
+      }
+    }
+  } catch (err) {
+    log.debug(`Failed to fetch folder context for ${folder}: ${err instanceof Error ? err.message : err}`)
+  }
+
+  return ""
+}
+
 // -- Plugin -------------------------------------------------------------------
 
 export const ClaudeMemPlugin: Plugin = async (ctx) => {
@@ -279,6 +469,11 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     log.warn(
       `Worker not reachable at ${getWorkerUrl()}. Start it with: claude-mem worker start`,
     )
+    // P2.3: Attempt auto-start if enabled
+    const started = await tryAutoStartWorker()
+    if (!started) {
+      log.warn("Set CLAUDE_MEM_AUTO_START=true to enable automatic worker startup")
+    }
   } else {
     log.info("Worker health check passed")
   }
@@ -349,7 +544,21 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       if (text && text.trim().length > 0) {
         contextCache = { text, timestamp: Date.now() }
         log.debug("Context injection cache miss — fetched and cached")
-        return text
+        // P2.2: Append last session's learned patterns if available
+        let enriched = text
+        if (lastSummary) {
+          const parts: string[] = []
+          if (lastSummary.learned?.length) {
+            parts.push("### Key Learnings from Last Session\n" + lastSummary.learned.map((l) => `- ${l}`).join("\n"))
+          }
+          if (lastSummary.next_steps?.length) {
+            parts.push("### Suggested Next Steps\n" + lastSummary.next_steps.map((s) => `- ${s}`).join("\n"))
+          }
+          if (parts.length > 0) {
+            enriched = text + "\n\n" + parts.join("\n\n")
+          }
+        }
+        return enriched
       }
     }
     return ""
@@ -431,7 +640,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
     summarySent = true
 
-    await workerFetch("/api/sessions/summarize", {
+    // P2.2: Parse structured summary from worker response
+    const summaryRes = await workerFetch("/api/sessions/summarize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -441,6 +651,14 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       }),
       critical: true,
     })
+
+    if (summaryRes?.ok) {
+      const summaryText = await summaryRes.text()
+      if (summaryText.trim()) {
+        lastSummary = parseSummaryResponse(summaryText)
+        log.debug(`Session summary stored (${lastSummary.raw?.length ?? 0} chars)`)
+      }
+    }
 
     // Signal processing complete (updates web viewer UI)
     await workerFetch("/api/processing", {
@@ -472,6 +690,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     recentToolFiles.clear()
     observationBuffer.length = 0
     recentHashes.clear()
+    folderContextCache.clear()
   }
 
   // -- Return plugin definition -----------------------------------------------
@@ -549,7 +768,9 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           const res = await workerFetch(`/api/search?${params}`)
           if (!res) return "claude-mem worker unreachable"
           if (!res.ok) return `Search failed: ${res.status}`
-          return await res.text()
+          const rawText = await res.text()
+          // P2.1: Enrich results with token cost information
+          return enrichSearchResults(rawText)
         },
       }),
 
@@ -680,6 +901,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           lines.push(`Observation buffer: ${observationBuffer.length} pending`)
           lines.push(`Queued critical requests: ${failedCriticalRequests.length}`)
           lines.push(`Log level: ${process.env.CLAUDE_MEM_LOG_LEVEL || "info"}`)
+          lines.push(`Folder context cache: ${folderContextCache.size} folders`)
+          lines.push(`Last summary: ${lastSummary ? "available" : "none"}`)
 
           if (version?.ok) {
             const v = (await version.json()) as { version?: string }
@@ -700,6 +923,25 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             `Active session: ${claudeSessionId || "none"}`,
           )
           return lines.join("\n")
+        },
+      }),
+
+      // P2.4: Folder context tool
+      claude_mem_folder_context: tool({
+        description:
+          "Get recent observations for a specific folder in the project. " +
+          "Useful for understanding recent activity in a directory before making changes.",
+        args: {
+          folder: tool.schema
+            .string()
+            .describe("Folder path relative to project root (e.g. 'src/auth')"),
+        },
+        async execute(args) {
+          if (!workerHealthy) {
+            return "\u26a0\ufe0f claude-mem worker is currently unreachable."
+          }
+
+          return await fetchFolderContext(args.folder, project) || "No recent observations for this folder."
         },
       }),
     },
@@ -749,6 +991,12 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             break
           }
           recordObservation("file.edited", (event as any).properties, null).catch(() => {})
+
+          // P2.4: Fetch folder-level context for edited file
+          if (file && typeof file === "string") {
+            const folder = file.split("/").slice(0, -1).join("/") || "."
+            fetchFolderContext(folder, project).catch(() => {})
+          }
           break
         }
 
