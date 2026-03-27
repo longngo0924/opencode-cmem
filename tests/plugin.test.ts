@@ -1,4 +1,4 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { describe, it, expect } from "bun:test"
 
 // ---------------------------------------------------------------------------
 // Tests for opencode-cmem plugin
@@ -7,31 +7,27 @@ import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 // correct requests without needing a running worker.
 // ---------------------------------------------------------------------------
 
-const WORKER_URL = "http://127.0.0.1:37777"
+import {
+  DEFAULT_PORT,
+  RETRY_MAX,
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
+  BATCH_MAX_SIZE,
+  DEDUP_WINDOW_MS,
+  FOLDER_CONTEXT_TTL_MS,
+  FOLDER_CACHE_MAX_ENTRIES,
+} from "../src/constants.js"
+import {
+  stripPrivateTags,
+  contentHash,
+  enrichSearchResults,
+  parseSummaryResponse,
+  generateSessionId,
+} from "../src/utils.js"
 
-// -- Mock helpers -------------------------------------------------------------
+const WORKER_URL = `http://127.0.0.1:${DEFAULT_PORT}`
 
-interface FetchCall {
-  url: string
-  method: string
-  body?: unknown
-}
-
-let fetchCalls: FetchCall[] = []
-let mockResponses: Map<string, { status: number; body: string }> = new Map()
-
-function setMockResponse(pathPrefix: string, status: number, body: string) {
-  mockResponses.set(pathPrefix, { status, body })
-}
-
-function findMockResponse(url: string): { status: number; body: string } {
-  for (const [prefix, response] of mockResponses) {
-    if (url.includes(prefix)) return response
-  }
-  return { status: 200, body: "{}" }
-}
-
-// -- Tests --------------------------------------------------------------------
+// -- Tests: URL construction ------------------------------------------------
 
 describe("workerFetch", () => {
   it("should construct correct URL with default port", () => {
@@ -46,11 +42,9 @@ describe("workerFetch", () => {
   })
 })
 
-describe("stripPrivateTags", () => {
-  function stripPrivateTags(text: string): string {
-    return text.replace(/<private>[\s\S]*?<\/private>/g, "")
-  }
+// -- Tests: stripPrivateTags ------------------------------------------------
 
+describe("stripPrivateTags", () => {
   it("should remove single private tag", () => {
     const input = "before <private>secret</private> after"
     expect(stripPrivateTags(input)).toBe("before  after")
@@ -76,6 +70,8 @@ describe("stripPrivateTags", () => {
   })
 })
 
+// -- Tests: observation payload ---------------------------------------------
+
 describe("observation payload", () => {
   it("should construct correct observation body", () => {
     const claudeSessionId = "opencode-myproject-1234567890"
@@ -97,13 +93,9 @@ describe("observation payload", () => {
     expect(body.cwd).toBe("/home/user/myproject")
     expect(JSON.parse(body.tool_input)).toEqual({ command: "ls -la" })
   })
-
-  it("should cap large tool responses at 10000 chars", () => {
-    const largeResponse = "x".repeat(20000)
-    const capped = largeResponse.slice(0, 10000)
-    expect(capped.length).toBe(10000)
-  })
 })
+
+// -- Tests: summary payload -------------------------------------------------
 
 describe("summary payload", () => {
   it("should construct correct summary body", () => {
@@ -117,13 +109,9 @@ describe("summary payload", () => {
     expect(body).toHaveProperty("last_user_message")
     expect(body).toHaveProperty("last_assistant_message")
   })
-
-  it("should cap messages at 5000 chars", () => {
-    const longMessage = "a".repeat(10000)
-    const capped = longMessage.slice(0, 5000)
-    expect(capped.length).toBe(5000)
-  })
 })
+
+// -- Tests: complete payload ------------------------------------------------
 
 describe("complete payload", () => {
   it("should only require claudeSessionId", () => {
@@ -131,6 +119,8 @@ describe("complete payload", () => {
     expect(Object.keys(body)).toEqual(["claudeSessionId"])
   })
 })
+
+// -- Tests: search params ---------------------------------------------------
 
 describe("search params", () => {
   it("should construct correct search URL params", () => {
@@ -150,6 +140,8 @@ describe("search params", () => {
   })
 })
 
+// -- Tests: context injection -----------------------------------------------
+
 describe("context injection", () => {
   it("should construct correct context inject URL", () => {
     const project = "emf"
@@ -164,10 +156,11 @@ describe("context injection", () => {
   })
 })
 
-describe("session ID format", () => {
+// -- Tests: session ID format -----------------------------------------------
+
+describe("generateSessionId", () => {
   it("should generate opencode-prefixed session IDs", () => {
-    const project = "emf"
-    const sessionId = `opencode-${project}-${Date.now()}`
+    const sessionId = generateSessionId("emf")
     expect(sessionId).toMatch(/^opencode-emf-\d+$/)
   })
 
@@ -178,25 +171,21 @@ describe("session ID format", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// P0.1: Retry backoff logic
-// ---------------------------------------------------------------------------
+// -- Tests: retry backoff ---------------------------------------------------
 
 describe("retry backoff", () => {
-  const RETRY_BASE_DELAY_MS = 1000
-
   it("should calculate exponential backoff delays (1s, 2s, 4s)", () => {
     const delays = [0, 1, 2].map((attempt) =>
-      Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), 8000),
+      Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS),
     )
     expect(delays[0]).toBe(1000)
     expect(delays[1]).toBe(2000)
     expect(delays[2]).toBe(4000)
   })
 
-  it("should cap backoff at 8 seconds", () => {
-    const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, 10), 8000)
-    expect(delay).toBe(8000)
+  it("should cap backoff at max delay", () => {
+    const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, 10), RETRY_MAX_DELAY_MS)
+    expect(delay).toBe(RETRY_MAX_DELAY_MS)
   })
 
   it("should not retry on 4xx client errors", () => {
@@ -216,8 +205,6 @@ describe("retry backoff", () => {
   it("should queue critical requests that fail all retries", () => {
     const queue: Array<{ path: string }> = []
     const critical = true
-    const retries = 3
-    // Simulate: all 4 attempts (initial + 3 retries) failed
     if (critical) {
       queue.push({ path: "/api/sessions/complete" })
     }
@@ -226,17 +213,13 @@ describe("retry backoff", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// P0.2: Health monitoring
-// ---------------------------------------------------------------------------
+// -- Tests: health monitoring -----------------------------------------------
 
 describe("health monitoring", () => {
   it("should track worker health state", () => {
     let workerHealthy = true
-    // Simulate health check failure
     workerHealthy = false
     expect(workerHealthy).toBe(false)
-    // Simulate recovery
     workerHealthy = true
     expect(workerHealthy).toBe(true)
   })
@@ -247,7 +230,6 @@ describe("health monitoring", () => {
     workerHealthy = true
     expect(wasUnhealthy).toBe(true)
     expect(workerHealthy).toBe(true)
-    // Should trigger retry of queued critical requests
   })
 
   it("should not trigger retry if worker was already healthy", () => {
@@ -255,17 +237,12 @@ describe("health monitoring", () => {
     const wasUnhealthy = !workerHealthy
     workerHealthy = true
     expect(wasUnhealthy).toBe(false)
-    // Should NOT trigger retry
   })
 })
 
-// ---------------------------------------------------------------------------
-// P0.3: Observation batching
-// ---------------------------------------------------------------------------
+// -- Tests: observation batching --------------------------------------------
 
 describe("observation batching", () => {
-  const BATCH_MAX_SIZE = 10
-
   it("should buffer observations and flush when reaching max size", () => {
     const buffer: string[] = []
     let flushCount = 0
@@ -279,7 +256,7 @@ describe("observation batching", () => {
     }
 
     expect(flushCount).toBe(1)
-    expect(buffer.length).toBe(2) // 2 remaining after flush
+    expect(buffer.length).toBe(2)
   })
 
   it("should clear buffer on session end", () => {
@@ -301,13 +278,6 @@ describe("observation batching", () => {
     expect(buffer.length).toBe(0)
   })
 
-  it("should flush buffer on session change", () => {
-    const buffer: string[] = ["obs-1", "obs-2", "obs-3"]
-    buffer.length = 0
-    // After session.created event
-    expect(buffer.length).toBe(0)
-  })
-
   it("should not flush empty buffer", () => {
     const buffer: string[] = []
     let flushed = false
@@ -320,20 +290,9 @@ describe("observation batching", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// P0.4: Content-hash deduplication
-// ---------------------------------------------------------------------------
+// -- Tests: content hash & dedup --------------------------------------------
 
-describe("content hash", () => {
-  function contentHash(toolName: string, input: string, response: string): string {
-    let hash = 0
-    const str = `${toolName}:${input.slice(0, 500)}:${response.slice(0, 500)}`
-    for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
-    }
-    return String(hash)
-  }
-
+describe("contentHash", () => {
   it("should produce consistent hash for same input", () => {
     const h1 = contentHash("bash", '{"command":"ls"}', "file1\nfile2")
     const h2 = contentHash("bash", '{"command":"ls"}', "file1\nfile2")
@@ -357,7 +316,6 @@ describe("content hash", () => {
     const longInput = "x".repeat(1200)
     const h1 = contentHash("tool", shortInput, "resp")
     const h2 = contentHash("tool", longInput, "resp")
-    // Both should hash the same since first 500 chars are identical
     expect(h1).toBe(h2)
   })
 
@@ -375,17 +333,6 @@ describe("content hash", () => {
 })
 
 describe("dedup logic", () => {
-  function contentHash(toolName: string, input: string, response: string): string {
-    let hash = 0
-    const str = `${toolName}:${input.slice(0, 500)}:${response.slice(0, 500)}`
-    for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
-    }
-    return String(hash)
-  }
-
-  const DEDUP_WINDOW_MS = 60_000
-
   it("should skip duplicate observations within dedup window", () => {
     const recentHashes = new Map<string, number>()
     const now = Date.now()
@@ -411,9 +358,9 @@ describe("dedup logic", () => {
     const recentHashes = new Map<string, number>()
     const now = Date.now()
 
-    recentHashes.set("hash1", now - 1000) // fresh
-    recentHashes.set("hash2", now - DEDUP_WINDOW_MS - 5000) // expired
-    recentHashes.set("hash3", now - DEDUP_WINDOW_MS - 10000) // expired
+    recentHashes.set("hash1", now - 1000)
+    recentHashes.set("hash2", now - DEDUP_WINDOW_MS - 5000)
+    recentHashes.set("hash3", now - DEDUP_WINDOW_MS - 10000)
 
     for (const [h, ts] of recentHashes) {
       if (now - ts > DEDUP_WINDOW_MS) recentHashes.delete(h)
@@ -431,45 +378,14 @@ describe("dedup logic", () => {
     const h2 = contentHash("read", '{"file":"src/index.ts"}', "output")
 
     recentHashes.set(h1, now)
-
-    // Different tools = different hashes = not deduplicated
     expect(h1).not.toBe(h2)
     expect(recentHashes.has(h2)).toBe(false)
   })
 })
 
-// ---------------------------------------------------------------------------
-// P2.1: Token cost enrichment for search results
-// ---------------------------------------------------------------------------
+// -- Tests: enrichSearchResults ---------------------------------------------
 
 describe("enrichSearchResults", () => {
-  function enrichSearchResults(rawText: string): string {
-    try {
-      const parsed = JSON.parse(rawText)
-      const results = Array.isArray(parsed) ? parsed : parsed.results || parsed.data || parsed.observations || [parsed]
-
-      if (!Array.isArray(results)) return rawText
-
-      const enriched = results.map((item: any) => {
-        const cost = item.read_cost ?? item.token_count ?? item.estimated_tokens ?? null
-        if (cost == null) return item
-        return {
-          ...item,
-          _cost_info: `~${cost} tokens to read full details`,
-        }
-      })
-
-      if (Array.isArray(parsed)) return JSON.stringify(enriched, null, 2)
-      const wrapper = { ...parsed }
-      if (parsed.results != null) wrapper.results = enriched
-      else if (parsed.data != null) wrapper.data = enriched
-      else if (parsed.observations != null) wrapper.observations = enriched
-      return JSON.stringify(wrapper, null, 2)
-    } catch {
-      return rawText
-    }
-  }
-
   it("should add _cost_info when results have read_cost", () => {
     const input = JSON.stringify([
       { id: 1, title: "Auth fix", read_cost: 500 },
@@ -482,27 +398,21 @@ describe("enrichSearchResults", () => {
   })
 
   it("should add _cost_info when results have token_count", () => {
-    const input = JSON.stringify([
-      { id: 1, title: "Bug fix", token_count: 1200 },
-    ])
+    const input = JSON.stringify([{ id: 1, title: "Bug fix", token_count: 1200 }])
     const result = enrichSearchResults(input)
     const parsed = JSON.parse(result)
     expect(parsed[0]._cost_info).toBe("~1200 tokens to read full details")
   })
 
   it("should add _cost_info when results have estimated_tokens", () => {
-    const input = JSON.stringify([
-      { id: 1, title: "Refactor", estimated_tokens: 800 },
-    ])
+    const input = JSON.stringify([{ id: 1, title: "Refactor", estimated_tokens: 800 }])
     const result = enrichSearchResults(input)
     const parsed = JSON.parse(result)
     expect(parsed[0]._cost_info).toBe("~800 tokens to read full details")
   })
 
   it("should not add _cost_info when no cost field exists", () => {
-    const input = JSON.stringify([
-      { id: 1, title: "No cost" },
-    ])
+    const input = JSON.stringify([{ id: 1, title: "No cost" }])
     const result = enrichSearchResults(input)
     const parsed = JSON.parse(result)
     expect(parsed[0]._cost_info).toBeUndefined()
@@ -552,28 +462,9 @@ describe("enrichSearchResults", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// P2.2: Structured summary parsing
-// ---------------------------------------------------------------------------
+// -- Tests: parseSummaryResponse --------------------------------------------
 
 describe("parseSummaryResponse", () => {
-  function parseSummaryResponse(raw: string) {
-    try {
-      const parsed = JSON.parse(raw)
-      return {
-        request: parsed.request ?? parsed.summary_request ?? undefined,
-        investigated: parsed.investigated ?? parsed.files_investigated ?? undefined,
-        learned: parsed.learned ?? parsed.key_learnings ?? parsed.insights ?? undefined,
-        completed: parsed.completed ?? parsed.tasks_completed ?? undefined,
-        next_steps: parsed.next_steps ?? parsed.suggested_next ?? undefined,
-        raw: raw,
-        timestamp: Date.now(),
-      }
-    } catch {
-      return { raw, timestamp: Date.now() }
-    }
-  }
-
   it("should parse structured summary with all fields", () => {
     const input = JSON.stringify({
       request: "Fix auth bug",
@@ -635,15 +526,11 @@ describe("parseSummaryResponse", () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// P2.3: Worker auto-start
-// ---------------------------------------------------------------------------
+// -- Tests: worker auto-start -----------------------------------------------
 
 describe("worker auto-start", () => {
   it("should respect CLAUDE_MEM_AUTO_START=true", () => {
-    // Auto-start is only triggered when env var is set
     const enabled = process.env.CLAUDE_MEM_AUTO_START === "true"
-    // By default it should be undefined (disabled)
     expect(enabled).toBe(false)
   })
 
@@ -654,20 +541,15 @@ describe("worker auto-start", () => {
   })
 
   it("should auto-start when env var is '1'", () => {
-    // Simulate env var being set to "1"
-    const envVal = "1"
+    const envVal: string = "1"
     const shouldStart = envVal === "true" || envVal === "1"
     expect(shouldStart).toBe(true)
   })
 })
 
-// ---------------------------------------------------------------------------
-// P2.4: Folder context
-// ---------------------------------------------------------------------------
+// -- Tests: folder context cache --------------------------------------------
 
 describe("folder context cache", () => {
-  const FOLDER_CONTEXT_TTL_MS = 120_000
-
   it("should cache folder context with TTL", () => {
     const cache = new Map<string, { folder: string; observations: string[]; timestamp: number }>()
     const now = Date.now()
@@ -699,25 +581,22 @@ describe("folder context cache", () => {
     expect(folder).toBe(".")
   })
 
-  it("should prune cache to max 10 folders", () => {
+  it("should prune cache to max entries", () => {
     const cache = new Map<string, { folder: string; observations: string[]; timestamp: number }>()
     const now = Date.now()
 
-    // Add 15 entries with staggered timestamps
     for (let i = 0; i < 15; i++) {
       cache.set(`folder-${i}`, { folder: `folder-${i}`, observations: [], timestamp: now - i * 1000 })
     }
 
-    // Prune to 10
-    if (cache.size > 10) {
+    if (cache.size > FOLDER_CACHE_MAX_ENTRIES) {
       const oldest = [...cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp)
-      for (let i = 0; i < oldest.length - 10; i++) {
+      for (let i = 0; i < oldest.length - FOLDER_CACHE_MAX_ENTRIES; i++) {
         cache.delete(oldest[i][0])
       }
     }
 
-    expect(cache.size).toBe(10)
-    // Oldest entries (highest index = earliest timestamp) should be removed
+    expect(cache.size).toBe(FOLDER_CACHE_MAX_ENTRIES)
     expect(cache.has("folder-14")).toBe(false)
     expect(cache.has("folder-10")).toBe(false)
     expect(cache.has("folder-9")).toBe(true)
