@@ -93,6 +93,7 @@ Both Claude Code and OpenCode talk to the same worker over HTTP. The worker writ
 |---|---|---|
 | `CLAUDE_MEM_WORKER_PORT` | `37777` | Worker API port |
 | `CLAUDE_MEM_WORKER_URL` | `http://127.0.0.1:37777` | Full worker URL (overrides port) |
+| `CLAUDE_MEM_LOG_LEVEL` | `info` | Log level: `error`, `warn`, `info`, `debug` |
 
 ## Development
 
