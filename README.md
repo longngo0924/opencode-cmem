@@ -25,10 +25,10 @@ Restart OpenCode. Done.
 ### Option B: npm plugin
 
 ```bash
-npm publish
+bun install -g opencode-cmem
 ```
 
-Then in `opencode.json`:
+Then add the plugin to your OpenCode config (`opencode.json` in your project root):
 
 ```json
 {
@@ -37,9 +37,37 @@ Then in `opencode.json`:
 }
 ```
 
-## What it does
+Restart OpenCode. The plugin will automatically connect to the claude-mem worker on `http://127.0.0.1:37777`.
 
-Maps claude-mem's 5-stage hook lifecycle to OpenCode events:
+## How it works
+
+```
+  ┌──────────────┐         ┌──────────────┐
+  │  Claude Code  │         │   OpenCode   │
+  │  (claude-mem  │         │  (opencode-  │
+  │   hooks)      │         │   cmem)      │
+  └──────┬───────┘         └──────┬───────┘
+         │                        │
+         │  POST /observations    │
+         │  GET  /context/inject  │
+         │  POST /summarize       │
+         ▼                        ▼
+  ┌──────────────────────────────────────┐
+  │       claude-mem Worker :37777       │
+  │       (localhost HTTP API)           │
+  └──────────────┬───────────────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────────────┐
+  │  ~/.claude-mem/claude-mem.db (SQLite)│
+  │  shared memory — both tools read &   │
+  │  write to the same database          │
+  └──────────────────────────────────────┘
+```
+
+Both Claude Code and OpenCode talk to the same worker over HTTP. The worker writes everything into a single SQLite database, so observations from one tool are immediately searchable in the other.
+
+## Hook lifecycle
 
 | Stage | Claude-mem hook | OpenCode hook | Worker API |
 |---|---|---|---|
