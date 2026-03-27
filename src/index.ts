@@ -19,29 +19,70 @@ import { tool } from "@opencode-ai/plugin"
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PORT = 37777
+const RETRY_MAX = 3
+const RETRY_BASE_DELAY_MS = 1000
+const HEALTH_CHECK_INTERVAL_MS = 30_000
+const BATCH_FLUSH_INTERVAL_MS = 5_000
+const BATCH_MAX_SIZE = 10
+const DEDUP_WINDOW_MS = 60_000
 
 function getWorkerUrl(): string {
   const port = process.env.CLAUDE_MEM_WORKER_PORT || DEFAULT_PORT
   return `http://127.0.0.1:${port}`
 }
 
+// -- Health monitoring (module-level, shared across plugin instances) ---------
+
+let workerHealthy = true
+let healthCheckTimer: ReturnType<typeof setInterval> | null = null
+
+// Queue of critical requests that failed and should be retried when worker recovers
+const failedCriticalRequests: Array<{ path: string; init: RequestInit }> = []
+
 /**
- * Fire-and-forget fetch — never blocks the agent.
- * Returns null on failure instead of throwing.
+ * Fetch with exponential backoff retry (P0.1).
+ *
+ * - Retries up to `retries` times with 1s × 2^attempt backoff (1s, 2s, 4s).
+ * - Non-retryable HTTP status codes (4xx) return immediately.
+ * - Critical requests (session init, complete, summary) are queued for later
+ *   retry if all attempts fail.
  */
 async function workerFetch(
   path: string,
-  init?: RequestInit & { timeout?: number },
+  init?: RequestInit & { timeout?: number; retries?: number; critical?: boolean },
 ): Promise<Response | null> {
-  const { timeout = 5000, ...fetchInit } = init || {}
-  try {
-    return await fetch(`${getWorkerUrl()}${path}`, {
-      ...fetchInit,
-      signal: AbortSignal.timeout(timeout),
-    })
-  } catch {
-    return null
+  const { timeout = 5000, retries = RETRY_MAX, critical = false, ...fetchInit } = init || {}
+  let lastError: Error | unknown = null
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${getWorkerUrl()}${path}`, {
+        ...fetchInit,
+        signal: AbortSignal.timeout(timeout),
+      })
+      if (res.ok) return res
+      // 4xx errors are client-side and not retryable
+      if (res.status >= 400 && res.status < 500) return res
+      lastError = new Error(`HTTP ${res.status}`)
+    } catch (err) {
+      lastError = err
+      workerHealthy = false
+    }
+
+    if (attempt < retries) {
+      const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), 8000)
+      await new Promise((r) => setTimeout(r, delay))
+    }
   }
+
+  if (critical) {
+    failedCriticalRequests.push({ path, init: fetchInit })
+    console.warn(
+      `[claude-mem] Critical request to ${path} failed after ${retries + 1} attempts, queued for retry`,
+    )
+  }
+
+  return null
 }
 
 /**
@@ -53,6 +94,59 @@ function stripPrivateTags(text: string): string {
   return text
     .replace(/<private>[\s\S]*?<\/private>/g, "")
     .replace(/<claude-mem-context>[\s\S]*?<\/claude-mem-context>/g, "")
+}
+
+/**
+ * Simple deterministic content hash for deduplication (P0.4).
+ * Uses first 500 chars of input/response to avoid hashing huge payloads.
+ */
+function contentHash(toolName: string, input: string, response: string): string {
+  let hash = 0
+  const str = `${toolName}:${input.slice(0, 500)}:${response.slice(0, 500)}`
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
+  }
+  return String(hash)
+}
+
+/**
+ * Start periodic health monitoring (P0.2). Checks worker health every 30s.
+ * When worker recovers, retries any queued critical requests.
+ */
+function startHealthMonitor(): void {
+  if (healthCheckTimer) return
+  healthCheckTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${getWorkerUrl()}/api/health`, {
+        signal: AbortSignal.timeout(2000),
+      })
+      const wasUnhealthy = !workerHealthy
+      workerHealthy = res.ok
+
+      if (wasUnhealthy && workerHealthy) {
+        console.info("[claude-mem] Worker recovered, retrying queued critical requests")
+        await retryFailedCriticalRequests()
+      }
+    } catch {
+      workerHealthy = false
+    }
+  }, HEALTH_CHECK_INTERVAL_MS)
+
+  // Don't prevent process exit
+  if (healthCheckTimer.unref) healthCheckTimer.unref()
+}
+
+/**
+ * Retry all queued critical requests. Called when worker recovers.
+ */
+async function retryFailedCriticalRequests(): Promise<void> {
+  const requests = failedCriticalRequests.splice(0)
+  for (const { path, init } of requests) {
+    const res = await workerFetch(path, { ...init, retries: 1, critical: true })
+    if (res?.ok) {
+      console.info(`[claude-mem] Successfully retried critical request to ${path}`)
+    }
+  }
 }
 
 // -- Plugin -------------------------------------------------------------------
@@ -79,13 +173,73 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
   let summarySent = false
   const recentToolFiles = new Set<string>()
 
+  // P0.3: Observation batching
+  interface BufferedObservation {
+    contentSessionId: string
+    tool_name: string
+    tool_input: string
+    tool_response: string
+    cwd: string
+  }
+  const observationBuffer: BufferedObservation[] = []
+  let batchTimer: ReturnType<typeof setInterval> | null = null
+
+  // P0.4: Content-hash dedup
+  const recentHashes = new Map<string, number>() // hash -> timestamp
+
+  // -- Start health monitoring -------------------------------------------------
+  startHealthMonitor()
+
   // -- Health check on startup (non-blocking) ---------------------------------
   const healthRes = await workerFetch("/api/health", { timeout: 2000 })
-  if (!healthRes || !healthRes.ok) {
+  workerHealthy = !!(healthRes && healthRes.ok)
+  if (!workerHealthy) {
     console.warn(
       `[claude-mem] Worker not reachable at ${getWorkerUrl()}. ` +
         `Start it with: claude-mem worker start`,
     )
+  }
+
+  // -- P0.3: Observation buffer flush ------------------------------------------
+  async function flushBuffer(): Promise<void> {
+    if (observationBuffer.length === 0) return
+
+    // Take all items from buffer
+    const items = observationBuffer.splice(0)
+
+    // Send in parallel (up to 5 concurrent)
+    const batchSize = 5
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize)
+      await Promise.all(
+        batch.map((obs) =>
+          workerFetch("/api/sessions/observations", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(obs),
+          }),
+        ),
+      )
+    }
+  }
+
+  // Start batch flush timer
+  function startBatchTimer(): void {
+    if (batchTimer) return
+    batchTimer = setInterval(() => {
+      flushBuffer().catch(() => {})
+    }, BATCH_FLUSH_INTERVAL_MS)
+    if (batchTimer.unref) batchTimer.unref()
+  }
+
+  startBatchTimer()
+
+  // -- P0.4: Dedup cache cleanup (remove entries older than DEDUP_WINDOW_MS) ---
+  function cleanDedupCache(): void {
+    const now = Date.now()
+    for (const [hash, ts] of recentHashes) {
+      if (now - ts > DEDUP_WINDOW_MS) recentHashes.delete(hash)
+    }
   }
 
   // -- Stage 1: SessionStart — inject prior context ---------------------------
@@ -115,11 +269,12 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         project,
         prompt: stripPrivateTags(prompt).slice(0, 5000) || "[opencode session]",
       }),
+      critical: true,
     })
     sessionInitialized = true
   }
 
-  // -- Stage 3: Record observation --------------------------------------------
+  // -- Stage 3: Record observation (with batching + dedup) --------------------
   async function recordObservation(
     toolName: string,
     toolInput: unknown,
@@ -142,22 +297,38 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         ? toolResponse
         : JSON.stringify(toolResponse || {})
 
-    await workerFetch("/api/sessions/observations", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contentSessionId: claudeSessionId,
-        tool_name: toolName,
-        tool_input: stripPrivateTags(inputStr).slice(0, 10000),
-        tool_response: stripPrivateTags(responseStr).slice(0, 10000),
-        cwd: ctx.directory || process.cwd(),
-      }),
-    })
+    // P0.4: Content-hash dedup — skip if seen within dedup window
+    const hash = contentHash(toolName, inputStr, responseStr)
+    const now = Date.now()
+    if (recentHashes.has(hash) && now - (recentHashes.get(hash) ?? 0) < DEDUP_WINDOW_MS) {
+      return // Skip duplicate
+    }
+    recentHashes.set(hash, now)
+    cleanDedupCache()
+
+    // P0.3: Buffer observation instead of sending immediately
+    const observation: BufferedObservation = {
+      contentSessionId: claudeSessionId,
+      tool_name: toolName,
+      tool_input: stripPrivateTags(inputStr).slice(0, 10000),
+      tool_response: stripPrivateTags(responseStr).slice(0, 10000),
+      cwd: ctx.directory || process.cwd(),
+    }
+    observationBuffer.push(observation)
+
+    // Flush immediately if buffer is full
+    if (observationBuffer.length >= BATCH_MAX_SIZE) {
+      await flushBuffer()
+    }
   }
 
   // -- Stage 4: Stop — generate summary ---------------------------------------
   async function sendSummary(): Promise<void> {
     if (!claudeSessionId || summarySent) return
+
+    // P0.3: Flush remaining observations before summary
+    await flushBuffer()
+
     summarySent = true
 
     await workerFetch("/api/sessions/summarize", {
@@ -168,6 +339,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         last_user_message: lastUserMessage.slice(0, 5000),
         last_assistant_message: lastAssistantMessage.slice(0, 5000),
       }),
+      critical: true,
     })
 
     // Signal processing complete (updates web viewer UI)
@@ -175,6 +347,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ isProcessing: false }),
+      critical: true,
     })
   }
 
@@ -187,6 +360,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ contentSessionId: claudeSessionId }),
+      critical: true,
     })
 
     claudeSessionId = null
@@ -196,6 +370,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     sessionInitialized = false
     summarySent = false
     recentToolFiles.clear()
+    observationBuffer.length = 0
+    recentHashes.clear()
   }
 
   // -- Return plugin definition -----------------------------------------------
@@ -248,6 +424,13 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             .describe("Pagination offset"),
         },
         async execute(args) {
+          if (!workerHealthy) {
+            return (
+              "\u26a0\ufe0f claude-mem worker is currently unreachable. " +
+              "The search will be attempted but may fail."
+            )
+          }
+
           const params = new URLSearchParams({
             query: args.query,
             format: "index",
@@ -281,6 +464,10 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             .describe("Array of observation IDs to fetch"),
         },
         async execute(args) {
+          if (!workerHealthy) {
+            return "\u26a0\ufe0f claude-mem worker is currently unreachable."
+          }
+
           const results = await Promise.all(
             args.ids.map((id) => workerFetch(`/api/observation/${id}`)),
           )
@@ -317,6 +504,10 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             .describe("Records after anchor (default: 3)"),
         },
         async execute(args) {
+          if (!workerHealthy) {
+            return "\u26a0\ufe0f claude-mem worker is currently unreachable."
+          }
+
           // Anchor-based timeline uses a different endpoint
           if (args.anchor != null) {
             const params = new URLSearchParams({ project })
@@ -350,6 +541,13 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             .describe("The memory content to save"),
         },
         async execute(args) {
+          if (!workerHealthy) {
+            return (
+              "\u26a0\ufe0f claude-mem worker is currently unreachable. " +
+              "Memory not saved."
+            )
+          }
+
           const res = await workerFetch("/api/memory/save", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -358,6 +556,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
               project,
               source: "opencode",
             }),
+            critical: true,
           })
           if (!res) return "claude-mem worker unreachable"
           if (!res.ok) return `Save failed: ${res.status}`
@@ -377,6 +576,9 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
           const lines: string[] = []
           lines.push(`Worker: ${health?.ok ? "healthy" : "unreachable"}`)
+          lines.push(`Health monitoring: active (${HEALTH_CHECK_INTERVAL_MS / 1000}s interval)`)
+          lines.push(`Observation buffer: ${observationBuffer.length} pending`)
+          lines.push(`Queued critical requests: ${failedCriticalRequests.length}`)
 
           if (version?.ok) {
             const v = (await version.json()) as { version?: string }
@@ -405,11 +607,15 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     event: async ({ event }) => {
       switch (event.type) {
         case "session.created":
+          // P0.3: Flush buffer from previous session
+          flushBuffer().catch(() => {})
           claudeSessionId = `opencode-${project}-${Date.now()}`
           contextInjected = false
           sessionInitialized = false
           summarySent = false
           recentToolFiles.clear()
+          recentHashes.clear()
+          observationBuffer.length = 0
           break
 
         case "session.idle":
@@ -420,7 +626,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           await completeSession()
           break
 
-        // P0: Track assistant messages for better summaries
+        // Track assistant messages for better summaries
         case "message.updated": {
           const msg = (event as any).properties?.info
           if (msg?.role === "assistant") {
@@ -433,7 +639,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           break
         }
 
-        // P1: Track file edits as observations (skip if already captured by tool.execute.after)
+        // Track file edits as observations (skip if already captured by tool.execute.after)
         case "file.edited": {
           const file = (event as any).properties?.file
           if (file && recentToolFiles.has(file)) {
@@ -444,7 +650,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           break
         }
 
-        // P2: Track session errors as observations
+        // Track session errors as observations
         case "session.error": {
           recordObservation("session.error", (event as any).properties, null).catch(() => {})
           break

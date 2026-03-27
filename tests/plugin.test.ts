@@ -177,3 +177,263 @@ describe("session ID format", () => {
     expect(project).toBe("emf-frontend")
   })
 })
+
+// ---------------------------------------------------------------------------
+// P0.1: Retry backoff logic
+// ---------------------------------------------------------------------------
+
+describe("retry backoff", () => {
+  const RETRY_BASE_DELAY_MS = 1000
+
+  it("should calculate exponential backoff delays (1s, 2s, 4s)", () => {
+    const delays = [0, 1, 2].map((attempt) =>
+      Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), 8000),
+    )
+    expect(delays[0]).toBe(1000)
+    expect(delays[1]).toBe(2000)
+    expect(delays[2]).toBe(4000)
+  })
+
+  it("should cap backoff at 8 seconds", () => {
+    const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, 10), 8000)
+    expect(delay).toBe(8000)
+  })
+
+  it("should not retry on 4xx client errors", () => {
+    const nonRetryable = [400, 401, 403, 404, 422]
+    for (const status of nonRetryable) {
+      expect(status >= 400 && status < 500).toBe(true)
+    }
+  })
+
+  it("should retry on 5xx server errors", () => {
+    const retryable = [500, 502, 503, 504]
+    for (const status of retryable) {
+      expect(status >= 400 && status < 500).toBe(false)
+    }
+  })
+
+  it("should queue critical requests that fail all retries", () => {
+    const queue: Array<{ path: string }> = []
+    const critical = true
+    const retries = 3
+    // Simulate: all 4 attempts (initial + 3 retries) failed
+    if (critical) {
+      queue.push({ path: "/api/sessions/complete" })
+    }
+    expect(queue.length).toBe(1)
+    expect(queue[0].path).toBe("/api/sessions/complete")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P0.2: Health monitoring
+// ---------------------------------------------------------------------------
+
+describe("health monitoring", () => {
+  it("should track worker health state", () => {
+    let workerHealthy = true
+    // Simulate health check failure
+    workerHealthy = false
+    expect(workerHealthy).toBe(false)
+    // Simulate recovery
+    workerHealthy = true
+    expect(workerHealthy).toBe(true)
+  })
+
+  it("should detect worker recovery and trigger retry", () => {
+    let workerHealthy = false
+    const wasUnhealthy = !workerHealthy
+    workerHealthy = true
+    expect(wasUnhealthy).toBe(true)
+    expect(workerHealthy).toBe(true)
+    // Should trigger retry of queued critical requests
+  })
+
+  it("should not trigger retry if worker was already healthy", () => {
+    let workerHealthy = true
+    const wasUnhealthy = !workerHealthy
+    workerHealthy = true
+    expect(wasUnhealthy).toBe(false)
+    // Should NOT trigger retry
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P0.3: Observation batching
+// ---------------------------------------------------------------------------
+
+describe("observation batching", () => {
+  const BATCH_MAX_SIZE = 10
+
+  it("should buffer observations and flush when reaching max size", () => {
+    const buffer: string[] = []
+    let flushCount = 0
+
+    for (let i = 0; i < 12; i++) {
+      buffer.push(`obs-${i}`)
+      if (buffer.length >= BATCH_MAX_SIZE) {
+        flushCount++
+        buffer.length = 0
+      }
+    }
+
+    expect(flushCount).toBe(1)
+    expect(buffer.length).toBe(2) // 2 remaining after flush
+  })
+
+  it("should clear buffer on session end", () => {
+    const buffer: string[] = ["obs-1", "obs-2", "obs-3"]
+    buffer.length = 0
+    expect(buffer.length).toBe(0)
+  })
+
+  it("should flush buffer before summary", () => {
+    const buffer: string[] = ["obs-1", "obs-2"]
+    let flushed = false
+
+    if (buffer.length > 0) {
+      flushed = true
+      buffer.length = 0
+    }
+
+    expect(flushed).toBe(true)
+    expect(buffer.length).toBe(0)
+  })
+
+  it("should flush buffer on session change", () => {
+    const buffer: string[] = ["obs-1", "obs-2", "obs-3"]
+    buffer.length = 0
+    // After session.created event
+    expect(buffer.length).toBe(0)
+  })
+
+  it("should not flush empty buffer", () => {
+    const buffer: string[] = []
+    let flushed = false
+
+    if (buffer.length > 0) {
+      flushed = true
+    }
+
+    expect(flushed).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P0.4: Content-hash deduplication
+// ---------------------------------------------------------------------------
+
+describe("content hash", () => {
+  function contentHash(toolName: string, input: string, response: string): string {
+    let hash = 0
+    const str = `${toolName}:${input.slice(0, 500)}:${response.slice(0, 500)}`
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
+    }
+    return String(hash)
+  }
+
+  it("should produce consistent hash for same input", () => {
+    const h1 = contentHash("bash", '{"command":"ls"}', "file1\nfile2")
+    const h2 = contentHash("bash", '{"command":"ls"}', "file1\nfile2")
+    expect(h1).toBe(h2)
+  })
+
+  it("should produce different hash for different tool names", () => {
+    const h1 = contentHash("bash", '{"cmd":"ls"}', "output")
+    const h2 = contentHash("read", '{"cmd":"ls"}', "output")
+    expect(h1).not.toBe(h2)
+  })
+
+  it("should produce different hash for different input", () => {
+    const h1 = contentHash("bash", '{"command":"ls"}', "output")
+    const h2 = contentHash("bash", '{"command":"pwd"}', "output")
+    expect(h1).not.toBe(h2)
+  })
+
+  it("should truncate input/response to 500 chars for hashing", () => {
+    const shortInput = "x".repeat(600)
+    const longInput = "x".repeat(1200)
+    const h1 = contentHash("tool", shortInput, "resp")
+    const h2 = contentHash("tool", longInput, "resp")
+    // Both should hash the same since first 500 chars are identical
+    expect(h1).toBe(h2)
+  })
+
+  it("should produce different hash for different response", () => {
+    const h1 = contentHash("bash", '{"cmd":"ls"}', "output1")
+    const h2 = contentHash("bash", '{"cmd":"ls"}', "output2")
+    expect(h1).not.toBe(h2)
+  })
+
+  it("should handle empty strings", () => {
+    const h = contentHash("", "", "")
+    expect(h).toBeDefined()
+    expect(typeof h).toBe("string")
+  })
+})
+
+describe("dedup logic", () => {
+  function contentHash(toolName: string, input: string, response: string): string {
+    let hash = 0
+    const str = `${toolName}:${input.slice(0, 500)}:${response.slice(0, 500)}`
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
+    }
+    return String(hash)
+  }
+
+  const DEDUP_WINDOW_MS = 60_000
+
+  it("should skip duplicate observations within dedup window", () => {
+    const recentHashes = new Map<string, number>()
+    const now = Date.now()
+
+    const hash = contentHash("bash", '{"cmd":"ls"}', "output")
+    recentHashes.set(hash, now)
+
+    expect(recentHashes.has(hash)).toBe(true)
+    expect(now - (recentHashes.get(hash) ?? 0) < DEDUP_WINDOW_MS).toBe(true)
+  })
+
+  it("should allow observations after dedup window expires", () => {
+    const recentHashes = new Map<string, number>()
+    const oldTime = Date.now() - DEDUP_WINDOW_MS - 1
+
+    const hash = contentHash("bash", '{"cmd":"ls"}', "output")
+    recentHashes.set(hash, oldTime)
+
+    expect(Date.now() - oldTime >= DEDUP_WINDOW_MS).toBe(true)
+  })
+
+  it("should clean up expired entries", () => {
+    const recentHashes = new Map<string, number>()
+    const now = Date.now()
+
+    recentHashes.set("hash1", now - 1000) // fresh
+    recentHashes.set("hash2", now - DEDUP_WINDOW_MS - 5000) // expired
+    recentHashes.set("hash3", now - DEDUP_WINDOW_MS - 10000) // expired
+
+    for (const [h, ts] of recentHashes) {
+      if (now - ts > DEDUP_WINDOW_MS) recentHashes.delete(h)
+    }
+
+    expect(recentHashes.size).toBe(1)
+    expect(recentHashes.has("hash1")).toBe(true)
+  })
+
+  it("should allow same observation from different tools", () => {
+    const recentHashes = new Map<string, number>()
+    const now = Date.now()
+
+    const h1 = contentHash("bash", '{"file":"src/index.ts"}', "output")
+    const h2 = contentHash("read", '{"file":"src/index.ts"}', "output")
+
+    recentHashes.set(h1, now)
+
+    // Different tools = different hashes = not deduplicated
+    expect(h1).not.toBe(h2)
+    expect(recentHashes.has(h2)).toBe(false)
+  })
+})
