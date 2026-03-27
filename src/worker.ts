@@ -13,9 +13,9 @@ import {
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
   HEALTH_CHECK_INTERVAL_MS,
-} from "./constants.js"
-import { log } from "./logger.js"
-import { getWorkerUrl } from "./config.js"
+} from "./constants"
+import { log } from "./logger"
+import { getWorkerUrl } from "./config"
 
 // -- Health state (module-level, shared across plugin instances) -------------
 

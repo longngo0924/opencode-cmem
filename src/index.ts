@@ -31,9 +31,9 @@ import {
   MAX_OBSERVATION_LENGTH,
   MAX_PROMPT_LENGTH,
   SKIP_TOOLS,
-} from "./constants.js"
-import { log } from "./logger.js"
-import { logConfigStatus, getWorkerUrl } from "./config.js"
+} from "./constants"
+import { log } from "./logger"
+import { logConfigStatus, getWorkerUrl } from "./config"
 import {
   workerFetch,
   isWorkerHealthy,
@@ -41,15 +41,15 @@ import {
   initialHealthCheck,
   tryAutoStartWorker,
   getPendingCriticalRequests,
-} from "./worker.js"
+} from "./worker"
 import {
   stripPrivateTags,
   contentHash,
   enrichSearchResults,
   parseSummaryResponse,
   generateSessionId,
-} from "./utils.js"
-import type { StructuredSummary } from "./utils.js"
+} from "./utils"
+import type { StructuredSummary } from "./utils"
 
 // -- Folder context cache (module-level, shared across plugin instances) -----
 

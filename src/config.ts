@@ -2,8 +2,8 @@
 // opencode-cmem — Configuration validation
 // ---------------------------------------------------------------------------
 
-import { DEFAULT_PORT } from "./constants.js"
-import { log } from "./logger.js"
+import { DEFAULT_PORT } from "./constants"
+import { log } from "./logger"
 
 export interface WorkerConfig {
   url: string
