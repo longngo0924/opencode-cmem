@@ -79,7 +79,7 @@ export function logConfigStatus(): WorkerConfig {
     for (const err of config.errors) log.error(err)
     log.warn(`Using default worker URL: ${config.url}`)
   } else {
-    log.info(`Worker URL: ${config.url}`)
+    log.debug(`Worker URL: ${config.url}`)
   }
   return config
 }

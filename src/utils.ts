@@ -133,3 +133,32 @@ export function parseSummaryResponse(raw: string): StructuredSummary {
 export function generateSessionId(project: string): string {
   return `opencode-${project}-${Date.now()}`
 }
+
+// -- OpenCode PartID generation -----------------------------------------------
+
+const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+/**
+ * Generate a valid OpenCode PartID.
+ * Format: "prt_" + 12 hex chars (timestamp-encoded) + 14 random base62 chars = 30 chars total.
+ * Must match OpenCode's Identifier schema which validates the "prt_" prefix.
+ */
+export function generatePartId(): string {
+  const timestamp = Date.now()
+  const counter = (Math.random() * 4096) | 0
+  let now = BigInt(timestamp) * BigInt(4096) + BigInt(counter)
+
+  const timeBytes = Buffer.alloc(6)
+  for (let i = 0; i < 6; i++) {
+    timeBytes[i] = Number((now >> BigInt(40 - 8 * i)) & BigInt(255))
+  }
+
+  let random = ""
+  const randomBytes = Buffer.alloc ? Buffer.alloc(14) : Buffer.allocUnsafe(14)
+  for (let i = 0; i < 14; i++) {
+    randomBytes[i] = (Math.random() * 62) | 0
+    random += BASE62_CHARS[randomBytes[i]]
+  }
+
+  return "prt_" + timeBytes.toString("hex") + random
+}

@@ -48,6 +48,7 @@ import {
   enrichSearchResults,
   parseSummaryResponse,
   generateSessionId,
+  generatePartId,
 } from "./utils"
 import type { StructuredSummary } from "./utils"
 
@@ -236,9 +237,10 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     }
 
     let workerContext = ""
+    // Read body as text first to avoid "body already used" if JSON parse fails
+    const bodyText = await res.text()
     try {
-      // Worker returns JSON: { content: [{ type: "text", text: "..." }] }
-      const data = await res.json() as { content?: Array<{ type: string; text: string }>; text?: string }
+      const data = JSON.parse(bodyText) as { content?: Array<{ type: string; text: string }>; text?: string }
       if (data?.content?.[0]?.text) {
         workerContext = data.content[0].text
       } else if (typeof data?.text === "string") {
@@ -247,8 +249,8 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
         workerContext = data as unknown as string
       }
     } catch {
-      // Fallback: response might be plain text
-      workerContext = await res.text()
+      // Response is plain text, use as-is
+      workerContext = bodyText
     }
 
     if (!workerContext.trim()) return ""
@@ -684,13 +686,16 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     },
 
     // == Chat message hook (capture user prompts) ===========================
-    // Only capture prompts from the primary agent (user's actual messages).
-    // Subagent delegation prompts (explorer, fixer, etc.) are internal and
-    // should NOT be stored as user prompts in claude-mem.
+    // OpenCode's chat.message hook fires for each user message. Subagent
+    // delegation (task tool) does NOT trigger this hook — it uses SubtaskPart
+    // internally — so no agent filtering is needed here.
     "chat.message": async (input, output) => {
-      const agentName = input.agent ?? "primary"
-      // Skip delegation prompts sent to subagents
-      if (agentName !== "primary") return
+      // Capture user's original text BEFORE injecting context, so we don't
+      // pollute the session prompt with injected claude-mem context.
+      const userTextParts = output.parts
+        .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text")
+        .map((p) => p.text)
+      const userText = userTextParts.join("\n")
 
       if (!contextInjected) {
         contextInjected = true
@@ -701,31 +706,27 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
             `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n`
           output.parts.push({
             type: "text",
-            id: `claude-mem-context-${Date.now()}`,
+            id: generatePartId(),
             sessionID: input.sessionID ?? "",
             messageID: input.messageID ?? "",
             text: header + context,
             synthetic: true,
           })
-          log.info(`Context injected into first message (${context.length} chars)`)
+          log.debug(`Context injected into first message (${context.length} chars)`)
         } else {
-          log.info("No context available for injection (worker returned empty or unreachable)")
+          log.debug("No context available for injection (worker returned empty or unreachable)")
         }
       }
 
-      const textParts = output.parts
-        .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text")
-        .map((p) => p.text)
-      const joined = textParts.join("\n")
-
-      if (stripPrivateTags(joined).trim().length === 0) {
+      // Store the user's original prompt (not the injected context)
+      if (stripPrivateTags(userText).trim().length === 0) {
         promptPrivate = true
         return
       }
 
       promptPrivate = false
-      if (textParts.length > 0) {
-        lastUserMessage = joined
+      if (userTextParts.length > 0) {
+        lastUserMessage = userText
         initSession(lastUserMessage).catch(() => {})
       }
     },
@@ -759,9 +760,9 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           `## Claude-Mem: Recent Session Context\n\n` +
           `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n`
         output.system.push(header + context)
-        log.info(`Context injected into system prompt (${context.length} chars)`)
+        log.debug(`Context injected into system prompt (${context.length} chars)`)
       } else {
-        log.info("No context available for injection (worker returned empty or unreachable)")
+        log.debug("No context available for injection (worker returned empty or unreachable)")
       }
     },
 
@@ -771,7 +772,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       const context = await injectContext()
       if (context) {
         output.context.push(`## Claude-Mem: Previous Session Context\n\n${context}`)
-        log.info(`Context re-injected during compaction (${context.length} chars)`)
+        log.debug(`Context re-injected during compaction (${context.length} chars)`)
       }
     },
   }
