@@ -692,6 +692,27 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       // Skip delegation prompts sent to subagents
       if (agentName !== "primary") return
 
+      if (!contextInjected) {
+        contextInjected = true
+        const context = await injectContext()
+        if (context) {
+          const header =
+            `## Claude-Mem: Recent Session Context\n\n` +
+            `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n`
+          output.parts.push({
+            type: "text",
+            id: `claude-mem-context-${Date.now()}`,
+            sessionID: input.sessionID ?? "",
+            messageID: input.messageID ?? "",
+            text: header + context,
+            synthetic: true,
+          })
+          log.info(`Context injected into first message (${context.length} chars)`)
+        } else {
+          log.info("No context available for injection (worker returned empty or unreachable)")
+        }
+      }
+
       const textParts = output.parts
         .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text")
         .map((p) => p.text)
