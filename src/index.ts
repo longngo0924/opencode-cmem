@@ -167,7 +167,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       log.warn("Set CLAUDE_MEM_AUTO_START=true to enable automatic worker startup")
     }
   } else {
-    log.info("Worker health check passed")
+    log.debug("Worker health check passed")
   }
 
   // -- Observation buffer flush ---------------------------------------------

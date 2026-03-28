@@ -126,7 +126,7 @@ export function startHealthMonitor(): void {
       workerHealthy = res.ok
 
       if (wasUnhealthy && workerHealthy) {
-        log.info("Worker recovered, retrying queued critical requests")
+        log.debug("Worker recovered, retrying queued critical requests")
         await retryFailedCriticalRequests()
       }
     } catch {
@@ -146,7 +146,7 @@ async function retryFailedCriticalRequests(): Promise<void> {
   for (const { path, init } of requests) {
     const res = await workerFetch(path, { ...init, retries: 1, critical: true })
     if (res?.ok) {
-      log.info(`Successfully retried critical request to ${path}`)
+      log.debug(`Successfully retried critical request to ${path}`)
     }
   }
 }
@@ -200,7 +200,7 @@ export async function tryAutoStartWorker(): Promise<boolean> {
         detached: true,
       })
       proc.unref()
-      log.info(`Auto-starting worker: ${cmd} (PID ${proc.pid})`)
+      log.debug(`Auto-starting worker: ${cmd} (PID ${proc.pid})`)
 
       // Wait briefly for worker to become ready
       for (let i = 0; i < 10; i++) {
@@ -210,7 +210,7 @@ export async function tryAutoStartWorker(): Promise<boolean> {
             signal: AbortSignal.timeout(2000),
           })
           if (res.ok) {
-            log.info("Worker auto-start succeeded")
+            log.debug("Worker auto-start succeeded")
             workerHealthy = true
             return true
           }
