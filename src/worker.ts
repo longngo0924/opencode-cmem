@@ -172,6 +172,17 @@ export function getPendingCriticalRequests(): number {
 
 let workerAutoStarted = false
 
+/** Reset module-level state (for testing only). */
+export function _resetWorkerState(): void {
+  workerHealthy = true
+  workerAutoStarted = false
+  failedCriticalRequests.length = 0
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer)
+    healthCheckTimer = null
+  }
+}
+
 /**
  * Attempt to auto-start the claude-mem worker if health check fails.
  * Controlled by `CLAUDE_MEM_AUTO_START` env var (default: disabled).

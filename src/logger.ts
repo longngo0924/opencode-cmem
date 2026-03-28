@@ -13,6 +13,8 @@ const LOG_LEVELS: Record<LogLevel, number> = {
 
 const LOG_PREFIX = "[claude-mem]"
 
+let currentLogLevel: number
+
 function resolveLogLevel(): number {
   const envLevel = process.env.CLAUDE_MEM_LOG_LEVEL?.toLowerCase()
   if (envLevel && envLevel in LOG_LEVELS) {
@@ -21,17 +23,27 @@ function resolveLogLevel(): number {
   return LOG_LEVELS.info
 }
 
-const currentLogLevel = resolveLogLevel()
+/** @internal Reset log level from environment (for testing) */
+export function _resetLogLevel(): void {
+  currentLogLevel = resolveLogLevel()
+}
+
+// Initialize on first load
+currentLogLevel = resolveLogLevel()
+
+// Use an indirection layer so that spyOn(console, ...) works in tests.
+// Bun inlines direct console.* calls, preventing spyOn from intercepting them.
+const con = console as Record<string, (...args: unknown[]) => void>
 
 export const log = {
   debug: (...args: unknown[]) =>
-    currentLogLevel >= 4 && console.debug(LOG_PREFIX, ...args),
+    currentLogLevel >= 4 && con["debug"](LOG_PREFIX, ...args),
   info: (...args: unknown[]) =>
-    currentLogLevel >= 3 && console.info(LOG_PREFIX, ...args),
+    currentLogLevel >= 3 && con["info"](LOG_PREFIX, ...args),
   warn: (...args: unknown[]) =>
-    currentLogLevel >= 2 && console.warn(LOG_PREFIX, ...args),
+    currentLogLevel >= 2 && con["warn"](LOG_PREFIX, ...args),
   error: (...args: unknown[]) =>
-    currentLogLevel >= 1 && console.error(LOG_PREFIX, ...args),
+    currentLogLevel >= 1 && con["error"](LOG_PREFIX, ...args),
 } as const
 
 export type { LogLevel }
