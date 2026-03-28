@@ -226,7 +226,14 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       `/api/context/inject?projects=${encodeURIComponent(project)}`,
       { timeout: 3000 },
     )
-    if (!res || !res.ok) return ""
+    if (!res) {
+      log.debug("injectContext: worker unreachable")
+      return ""
+    }
+    if (!res.ok) {
+      log.debug(`injectContext: worker returned ${res.status}`)
+      return ""
+    }
 
     let workerContext = ""
     try {
@@ -719,23 +726,31 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
     // == System prompt injection (first message) ============================
     "experimental.chat.system.transform": async (_input, output) => {
-      if (contextInjected) return
+      log.debug("system.transform hook fired")
+      if (contextInjected) {
+        log.debug("Context already injected, skipping")
+        return
+      }
       contextInjected = true
       const context = await injectContext()
       if (context) {
-        output.system.push(
+        const header =
           `## Claude-Mem: Recent Session Context\n\n` +
-          `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n` +
-          context
-        )
+          `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n`
+        output.system.push(header + context)
+        log.info(`Context injected into system prompt (${context.length} chars)`)
+      } else {
+        log.info("No context available for injection (worker returned empty or unreachable)")
       }
     },
 
     // == Context re-injection during compaction =============================
     "experimental.session.compacting": async (_input, output) => {
+      log.debug("session.compacting hook fired — re-injecting context")
       const context = await injectContext()
       if (context) {
         output.context.push(`## Claude-Mem: Previous Session Context\n\n${context}`)
+        log.info(`Context re-injected during compaction (${context.length} chars)`)
       }
     },
   }
