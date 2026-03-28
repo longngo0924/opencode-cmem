@@ -637,7 +637,14 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
     },
 
     // == Chat message hook (capture user prompts) ===========================
-    "chat.message": async (_input, output) => {
+    // Only capture prompts from the primary agent (user's actual messages).
+    // Subagent delegation prompts (explorer, fixer, etc.) are internal and
+    // should NOT be stored as user prompts in claude-mem.
+    "chat.message": async (input, output) => {
+      const agentName = input.agent ?? "primary"
+      // Skip delegation prompts sent to subagents
+      if (agentName !== "primary") return
+
       const textParts = output.parts
         .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text")
         .map((p) => p.text)
