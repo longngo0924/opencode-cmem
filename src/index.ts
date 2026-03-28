@@ -64,6 +64,7 @@ const folderContextCache = new Map<string, FolderContext>()
 // -- Cross-session summary (module-level) -----------------------------------
 
 let lastSummary: StructuredSummary | null = null
+let previousSessionMessage: string | null = null
 
 // -- Folder context helper ---------------------------------------------------
 
@@ -225,35 +226,70 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       `/api/context/inject?projects=${encodeURIComponent(project)}`,
       { timeout: 3000 },
     )
-    if (res && res.ok) {
-      const text = await res.text()
-      if (text.trim()) {
-        contextCache = { text, timestamp: Date.now() }
-        log.debug("Context injection cache miss — fetched and cached")
+    if (!res || !res.ok) return ""
 
-        let enriched = text
-        if (lastSummary) {
-          const parts: string[] = []
-          if (lastSummary.learned?.length) {
-            parts.push(
-              "### Key Learnings from Last Session\n" +
-                lastSummary.learned.map((l) => `- ${l}`).join("\n"),
-            )
-          }
-          if (lastSummary.next_steps?.length) {
-            parts.push(
-              "### Suggested Next Steps\n" +
-                lastSummary.next_steps.map((s) => `- ${s}`).join("\n"),
-            )
-          }
-          if (parts.length > 0) {
-            enriched = text + "\n\n" + parts.join("\n\n")
-          }
-        }
-        return enriched
+    let workerContext = ""
+    try {
+      // Worker returns JSON: { content: [{ type: "text", text: "..." }] }
+      const data = await res.json() as { content?: Array<{ type: string; text: string }>; text?: string }
+      if (data?.content?.[0]?.text) {
+        workerContext = data.content[0].text
+      } else if (typeof data?.text === "string") {
+        workerContext = data.text
+      } else if (typeof (data as any) === "string") {
+        workerContext = data as unknown as string
+      }
+    } catch {
+      // Fallback: response might be plain text
+      workerContext = await res.text()
+    }
+
+    if (!workerContext.trim()) return ""
+
+    contextCache = { text: workerContext, timestamp: Date.now() }
+    log.debug("Context injection cache miss — fetched and cached")
+
+    // Build enriched context with progressive disclosure layers
+    const sections: string[] = [workerContext]
+
+    // Layer: Last session summary enrichment
+    if (lastSummary) {
+      const summaryParts: string[] = []
+      if (lastSummary.request) {
+        summaryParts.push(`**Request:** ${lastSummary.request}`)
+      }
+      if (lastSummary.learned?.length) {
+        summaryParts.push(
+          "### Key Learnings from Last Session\n" +
+            lastSummary.learned.map((l) => `- ${l}`).join("\n"),
+        )
+      }
+      if (lastSummary.completed?.length) {
+        summaryParts.push(
+          "### Completed\n" +
+            lastSummary.completed.map((c) => `- ${c}`).join("\n"),
+        )
+      }
+      if (lastSummary.next_steps?.length) {
+        summaryParts.push(
+          "### Suggested Next Steps\n" +
+            lastSummary.next_steps.map((s) => `- ${s}`).join("\n"),
+        )
+      }
+      if (summaryParts.length > 0) {
+        sections.push(summaryParts.join("\n\n"))
       }
     }
-    return ""
+
+    // Layer: "Previously" — last assistant message from prior session
+    if (previousSessionMessage) {
+      const truncated = previousSessionMessage.slice(0, 500)
+      sections.push(
+        `**Previously**\n\n${truncated}${previousSessionMessage.length > 500 ? "..." : ""}`
+      )
+    }
+
+    return sections.join("\n\n")
   }
 
   // -- Session lifecycle ----------------------------------------------------
@@ -594,6 +630,10 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
               critical: true,
             })
           }
+          // Preserve last message for "Previously" section in next session
+          if (lastAssistantMessage) {
+            previousSessionMessage = lastAssistantMessage
+          }
           resetSession()
           break
 
@@ -683,7 +723,11 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       contextInjected = true
       const context = await injectContext()
       if (context) {
-        output.system.push(`## Claude-Mem: Previous Session Context\n\n${context}`)
+        output.system.push(
+          `## Claude-Mem: Recent Session Context\n\n` +
+          `⚠️ **MANDATORY: claude-mem Context Check** — BEFORE starting work, use \`claude_mem_search\` to query past observations, \`claude_mem_timeline\` for chronological context, and \`claude_mem_get_observations\` to fetch full details by ID. This ensures you have complete project history.\n\n` +
+          context
+        )
       }
     },
 

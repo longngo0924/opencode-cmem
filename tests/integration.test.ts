@@ -44,8 +44,8 @@ const mockServer = Bun.serve({
       }
 
       if (url.pathname === "/api/context/inject") {
-        return new Response("Previous session context from mock worker", {
-          headers: { "Content-Type": "text/plain" },
+        return Response.json({
+          content: [{ type: "text", text: "# $CMEM test-project\n\n### Today\n123 9:00a 🔍 Test observation\n" }]
         })
       }
 
@@ -233,7 +233,7 @@ describe("opencode-cmem integration", () => {
 
       // System prompt should contain injected context
       expect(output1.system.length).toBeGreaterThan(0)
-      expect(output1.system[0]).toContain("Claude-Mem: Previous Session Context")
+      expect(output1.system[0]).toContain("Claude-Mem: Recent Session Context")
     })
 
     it("should invalidate cache on session.created", async () => {
