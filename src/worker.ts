@@ -93,7 +93,7 @@ export async function workerFetch(
 
   if (critical) {
     failedCriticalRequests.push({ path, init: fetchInit })
-    log.warn(
+    log.debug(
       `Critical request to ${path} failed after ${retries + 1} attempts, queued for retry`,
     )
   }
@@ -230,7 +230,7 @@ export async function tryAutoStartWorker(): Promise<boolean> {
         }
       }
 
-      log.warn(`Worker auto-start via "${cmd}" did not become ready in time`)
+      log.debug(`Worker auto-start via "${cmd}" did not become ready in time`)
     } catch (err) {
       log.debug(
         `Auto-start command "${cmd}" not available: ${err instanceof Error ? err.message : err}`,
@@ -238,6 +238,6 @@ export async function tryAutoStartWorker(): Promise<boolean> {
     }
   }
 
-  log.warn("Worker auto-start failed. Start manually: claude-mem worker start")
+  log.debug("Worker auto-start failed. Start manually: claude-mem worker start")
   return false
 }

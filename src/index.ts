@@ -161,12 +161,12 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
   const healthy = await initialHealthCheck()
   if (!healthy) {
-    log.warn(
-      `Worker not reachable at ${getWorkerUrl()}. Start it with: claude-mem worker start`,
+    log.info(
+      `Worker not reachable at ${getWorkerUrl()}. Set CLAUDE_MEM_LOG_LEVEL=debug for details.`,
     )
     const started = await tryAutoStartWorker()
     if (!started) {
-      log.warn("Set CLAUDE_MEM_AUTO_START=true to enable automatic worker startup")
+      log.debug("Set CLAUDE_MEM_AUTO_START=true to enable automatic worker startup")
     }
   } else {
     log.debug("Worker health check passed")
