@@ -33,7 +33,7 @@ currentLogLevel = resolveLogLevel()
 
 // Use an indirection layer so that spyOn(console, ...) works in tests.
 // Bun inlines direct console.* calls, preventing spyOn from intercepting them.
-const con = console as Record<string, (...args: unknown[]) => void>
+const con = console as unknown as Record<string, (...args: unknown[]) => void>
 
 export const log = {
   debug: (...args: unknown[]) =>
